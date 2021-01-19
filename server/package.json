@@ -1,0 +1,43 @@
+{
+  "name": "paas-full-demo",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "exit 0"
+  },
+  "author": "",
+  "repository": "https://github.com/vhall/VHYun_SDK_Full_Demo",
+  "engines": {
+    "node": ">=12"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@hapi/boom": "^7.4.11",
+    "@hapi/bourne": "^2.0.0",
+    "@hapi/catbox": "^10.2.3",
+    "@hapi/catbox-memory": "^5.0.0",
+    "@hapi/catbox-redis": "^6.0.2",
+    "@hapi/hapi": "^20.0.3",
+    "@hapi/inert": "^5.2.2",
+    "@hapi/wreck": "^17.1.0",
+    "@hapi/yar": "^9.2.1",
+    "biguint-format": "^1.0.2",
+    "flake-idgen": "^1.4.0",
+    "getconfig": "^4.5.0",
+    "joi": "^17.3.0",
+    "lodash": "^4.17.20",
+    "moment": "^2.29.1",
+    "mysql2": "^2.2.5",
+    "node-schedule": "^1.3.2",
+    "pg": "^8.5.1",
+    "private-ip": "^2.0.0",
+    "sequelize": "^6.3.5",
+    "uuid": "^8.3.2"
+  },
+  "devDependencies": {},
+  "optionalDependencies": {
+    "selfsigned": "^1.10.8",
+    "sqlite3": "^5.0.0"
+  }
+}
