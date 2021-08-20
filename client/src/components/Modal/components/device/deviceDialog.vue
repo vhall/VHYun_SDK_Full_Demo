@@ -9,7 +9,6 @@
     <!--设备选择-->
     <Device
       :handlerDevice="handlerDeviceSelect"
-      :selectType="selectType"
       :attributes="attributes"
       :mustStream="mustStream"
       :rtc="rtc"
@@ -24,7 +23,7 @@ import Device from '@/components/Device'
 export default {
   name: 'DeviceDialog',
   components: { VhDialog, Device },
-  props: ['closeOnClickModal', 'attributes', 'rtc', 'onSelect', 'selectType', 'mustStream'],
+  props: ['closeOnClickModal', 'attributes', 'rtc', 'onSelect', 'mustStream'],
   data: () => ({
     visible: true
   }),

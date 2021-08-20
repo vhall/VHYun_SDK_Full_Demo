@@ -1,590 +1,517 @@
 'use strict'
-const net = require('net')
-const isIpPrivate = require('private-ip')
-const Boom = require('@hapi/boom')
-const util = require('util')
-const fs = require('fs')
 const _ = require('lodash')
-const uuid = require('uuid')
-const {safeParse} = require('@hapi/bourne')
-const { flakeId, randomNickname, demoAuth } = require('../utils')
-const { Rooms, Sessions } = require('../models')
-// 互动房间身份
-const INAV_IDENTITY = { master: 'master', helper: 'helper', guest: 'guest', player: 'player' }
-const DEFAULT_AVATAR = 'https://static.vhallyun.com/jssdk/vhall-jssdk-chat/latest/images/avatar.png'
-const MAX_MEMBER = 6
+const utils = require('../utils')
+const room = require('../plugins/room')
 
-// 创建一个全新的room
-async function createNewRoom(methods, sid, title, appId){
-  const maxMember = MAX_MEMBER
-  // 创建推流id
-  const paasLiveId = await methods.paas.createLss()
-  // 创建聊天id
-  const paasImId = await methods.paas.createChannel()
-  // 创建互动id
-  const paasInavId = await methods.paas.createIls(maxMember)
-  // 默认打开旁路开关
-  // await methods.paas.setIlsAnotherOpen(paasInavId, true).catch(() => null)
-  const record = { id: flakeId(), sid, appId, paasLiveId, paasImId, paasInavId, title: title || '', maxMember: maxMember, lastUse: null }
-  // 保存房间信息到数据库
-  const room = await Rooms.create(record)
-  return methods.room.getRoom(room.id)
+// 检测状态并发送开始旁路
+async function liveBroadcastStartEmit(req, roomId, paasImId) {
+  let rs
+  await utils.wait(1000 * 6)
+  // 检查旁路
+  rs = await req.server.methods.tinyCache.getTinyCache('live_broadcast_start.'+ roomId, Date.now()).catch(() => null)
+  // 已经在backend里面发过了
+  if (rs) return
+
+  await utils.wait(1000 * 15)
+  // 检查旁路
+  rs = await req.server.methods.tinyCache.getTinyCache('live_broadcast_start.'+ roomId, Date.now()).catch(() => null)
+  // 已经在backend里面发过了
+  if (rs) return
+
+  // 检查流是否在线 1推流中 2未推流或推流结束
+  const rs0 = await req.server.methods.paas.getLssStreamStatus(roomId)
+  const status = parseInt(rs0.streamStatus)
+  if (status !== 1) req.server.log('info', `[${roomId}] Lss Stream is stop`)
+
+  // 发送自定义消息，开始旁路
+  const b = { type: 'live_broadcast_start', roomId, sourceId: utils.SPECIAL_ACCOUNT_ID.MASTER, targetId: utils.SPECIAL_ACCOUNT_ID.EVERYONE }
+  const body = { ...b, time: Date.now() }
+  await req.server.methods.paas.sendCustomMessage(paasImId, utils.SPECIAL_ACCOUNT_ID.SYSTEM, null, body).catch(() => null)
 }
 
-// 获取请求的info
-async function fetchRequestUserInfo(req){
-  const info = {}
-  info.ip = req.info.remoteAddress
-  info.userAgent = _.truncate(req.headers['user-agent'], { length: 255, omission: '' })
-  info.origin = _.truncate(req.headers.origin || req.url.toString(), { length: 255, omission: '' })
+// 生成一个sid
+exports.token = async (req, h) => {
+  /* @register method:get auth:false */
+  const token = req.user.token
+  if (req.query.type === 'script') return h.response(`document.cookie='sid=${token};'`).type('application/javascript')
+  return h.jdata({ token })
+}
 
-  const xIp = _.trim(req.headers['x-real-ip'] || (req.headers['x-forwarded-for'] && req.headers['x-forwarded-for'].splice(',')[0]))
-  if (xIp && net.isIP(xIp) && isIpPrivate(info.ip)) {
-    info.ipAddress = xIp
+// 伪登陆
+exports.login = async (req, h) => {
+  /* @register method:post auth:false */
+  const nickName = req.payload.nickName || utils.randomNickname()
+  if (_.size(nickName) > 20) return h.fail('您的名称过长')
+  let token = req.user.token || utils.randomId()
+  let accountId = await req.user.getAccountIdByName(nickName)
+  if (!accountId) {
+    accountId = utils.flakeId().split('').reverse().join('')
+    await req.user.saveAccountId(token, { accountId, nickName })
   }
-  return info
+  if (!req.user.accountId) {
+    await req.user.saveAccountId(token, { accountId, nickName })
+    setTimeout(() => req.user.saveSession().catch(() => null))
+  }
+
+  // check admin
+  if (req.payload.sign && req.payload.time) {
+    const rs = await utils.demoAuth(req.server.app.paas.appId, req.server.app.paas.secretKey, req.payload.time, req.payload.sign)
+    if (!rs) return h.jdata({ auth: 0 })
+    await req.user.saveAdminId(token, { accountId, nickName, isAdmin: true })
+    return h.jdata({ auth: 1, accountId, token, nickName })
+  }
+  // 注意：同一个直播间两个AccountId不能同时拥有两个身份
+  // const option = { path: '/', ttl: null }
+  return h.jdata({ accountId, token, nickName }) // .state('token', token, option)
 }
 
-// 保存信息到session
-async function saveSession(req, username){
-  const sid = req.yar.id
-  const info = await fetchRequestUserInfo(req)
-  const record = { ...info, roomCounter: 1, from: 0, sid, username }
-  await Sessions.upsert(record)
+// 根据title或roomId获取互动房间信息
+exports.info = async (req, h) => {
+  /* @register auth:false */
+  let roomId = req.query.roomId
+  const title = req.query.title
+  const isVod = req.query.isVod
+  if (!(roomId || title)) return h.fail('参数错误，无法取得互动房间信息')
+  let info
+  let vod
+
+  // 直播
+  if (!isVod || isVod === '0' || isVod === 'false') {
+    // 根据roomId取得互动房间信息
+    if (title && !roomId) roomId = await req.server.methods.room.getRoomIdByTitle(title, false)
+    info = await req.server.methods.room.getRoomInfo(roomId)
+    if (!info) return h.jdata({ roomId: '', title, randomNickname: utils.randomNickname(), status: 0, vod: 1  })
+    // 直播已结束
+    if (info.status === 4) vod = await req.server.methods.room.getRoomVod(roomId).catch(() => null)
+
+    const status = info.status
+    // 录播生成状态： 1直播未开始/结束 2录播生成中/审核中 3已生成录播
+    const vodStatus = !vod ? 1 : 3
+    const result = { roomId: info.id, title: info.title, randomNickname: utils.randomNickname(), status, vod: vodStatus }
+    return h.jdata(result)
+  }
+
+  // 录播
+  do {
+    // 首先取录播信息，根据roomId
+    if (roomId) vod = await req.server.methods.room.getRoomVod(roomId)
+    if (vod) break
+
+    // 纯数字，尝试把这个数字作为roomId获取
+    if ((/^\d+$/).test(title)) vod = await req.server.methods.room.getRoomVod(title)
+    if (vod) break
+
+    // 然后根据title取录播信息
+    if (title) roomId = await req.server.methods.room.getRoomIdByTitle(title, true)
+    if (!roomId) return h.fail('录播不存在')
+
+    // 再次取录播信息，根据roomId
+    if (roomId) vod = await req.server.methods.room.getRoomVod(roomId)
+    if (vod) break
+
+    const result = { roomId: roomId || '', title: title || '', randomNickname: utils.randomNickname(), status: 0, vod: 1 }
+    return h.jdata(result)
+  } while (false)
+
+  // 录播生成状态： 1直播未开始/结束 2录播生成中/审核中 3已生成录播
+  const vodStatus = vod ? 3 : 1
+  const result = { roomId: vod && vod.roomId || roomId || '', title: vod && vod.title || title || '', randomNickname: utils.randomNickname(), status: 0, vod: vodStatus }
+  return h.jdata(result)
 }
 
 // 创建互动房间
 exports.create = async (req, h) => {
-  const sid = req.yar.id
-  const { title, username } = req.payload
-  if (!title) return Boom.badRequest('请填写互动房间名称')
-  if (_.size(title) > 50) return Boom.badRequest('互动房间名称过长')
-  if (!username) return Boom.badRequest('请填写您的名称')
-  if (_.size(username) > 10) return Boom.badRequest('您的名称过长')
+  /* @register method:post */
+  const { title, type } = req.payload || {}
+  if (!type) return h.fail('请填写互动房间类型')
+  if (!title) return h.fail('请填写互动房间名称')
+  if (_.size(title) > 50) return h.fail('互动房间名称过长')
+  const accountId = req.user.accountId
 
-  // 新用户，保存用户session
-  if (!req.state.sid) {
-    try {
-      await saveSession(req, username)
-    } catch (e) {
-      return Boom.serverUnavailable(e.message)
+  let info
+  const findId = await req.server.methods.room.getRoomIdByTitle(title)
+  // 房间已存在
+  if (findId) {
+    info = await req.server.methods.room.getRoomInfo(findId)
+    if (info.type !== type) return h.fail('该直播间已作为其他推流类型使用')
+    // 1未开播 2准备中 3直播中 4已结束
+    if (info.status === 3) return h.fail('该直播间名称已被使用')
+
+    if (info.status !== 4) {
+      return h.jdata({ roomId: info.id, title: info.title, type: info.type, status: info.status })
     }
   }
 
-  // 创建次数计数
-  const roomCounter = await req.yar.get('room_counter') || 0
-  req.yar.set('room_counter', roomCounter + 1)
+  if ((/^\d+$/).test(title)) return h.fail('房间名不允许使用纯数字')
+  // 已结束，则销毁旧的并创建一个新的
+  if (info && info.status !== 4) await req.server.methods.room.destroyRoom(findId)
 
-  let find
-  try {
-    find = await req.server.methods.room.getRoomByTitle(title)
-  } catch (e) {
-    return Boom.serverUnavailable(e.message)
-  }
-  let room
-  if (find) {
-    // 检查这个room是不是当前用户创建的，如果是，则直接返回
-    if (find.sid === sid) {
-      return h.jdata({ id: find.id, title: find.title, username, userId: sid })
-    } else {
-      // 已经创建，但是没有人用过
-      if (!find.lastUse) {
-        return h.jdata({ id: find.id, title: find.title, username, userId: sid })
-      }
-    }
-    req.log('info', `room is use: ` + find.id + ' ' + find.title)
+  const appId = req.server.app.paas.appId
+  const room = await req.server.methods.room.createNewRoom(null, appId, type, title, accountId)
 
-    try {
-      room = find
-      let $masterId = await req.server.methods.room.getRoomValue(room.id, 'master_user_id')
-      const res = await req.server.methods.paas.getIlsUsers(room.paasInavId).catch(e => e)
-      if (Array.isArray(res) && res.length) {
-        if (res.length >= room.maxMember) return Boom.badRequest('这个互动房间名称已被使用')
-        const masterInRoom = res.findIndex(item => item.third_party_user_id === $masterId) >= 0
-        if (masterInRoom) return Boom.badRequest('这个互动房间名称已被使用')
-      }
-
-      await Rooms.update({ lastUse: null }, { where: { id: room.id } })
-      await req.server.methods.room.setRoomValue(room.id, 'lastUse', '')
-      req.yar.id = room.sid
-    } catch (e) {
-      return Boom.serverUnavailable('获取房间状态线人数出错：' + e.message)
-    }
-    // return Boom.badRequest('这个互动房间名称已被使用')
-  }
-
-  if (!room) {
-    try {
-      // 创建一个全新的room
-      room = await createNewRoom(req.server.methods, sid, title, req.server.app.paas.appId)
-    } catch (e) {
-      return Boom.serverUnavailable('创建互动房间出错：' + e.message)
-    }
-  }
-
-  return h.jdata({ id: room.id, title: room.title, username, userId: sid })
-    .state('roomId', `${room.id}`, { isHttpOnly: false, isSecure: false, isSameSite: 'Lax', path: '/' })
+  req.log('info', `创建互动房间, roomId:${room.id} title:${title} accountId:${req.user && req.user.accountId}`)
+  const status = room.status
+  return h.jdata({ roomId: room.id, title: room.title, type: room.type, status })
 }
 
-// 开始推流（旁路）(您应该自己检查权限)
-exports.another = async (req, h) => {
-  const { roomId, open, maxScreenStream, time } = req.payload
-  if (!roomId) return Boom.badRequest('互动房间没有指定')
-  let room = await req.server.methods.room.getRoom(roomId)
-  if (!room) return Boom.badRequest('互动房间不存在')
+// 重新开启互动房间
+exports.reopen = async (req, h) => {
+  /* @register method:post auth:false */
+  const { roomId, title } = req.payload || {}
+  const findId = await req.server.methods.room.getRoomIdByTitle(roomId || title)
+  if (!findId) return h.fail('该直播间不存在')
 
-  // 判断用户是否有"推流"权限（仅限主持人）
-  const master_user_id = await req.server.methods.room.getRoomValue(roomId, 'master_user_id')
-  // const helper_user_id = await req.server.methods.room.getRoomValue(roomId, 'helper_user_id')
-  if (master_user_id !== req.yar.id && room.sid !== req.yar.id) {
-    return Boom.badRequest('没有推流权限')
-  }
+  const info = await req.server.methods.room.getRoomInfo(findId)
+  // 清理直播间数据，重新开播
+  await req.server.methods.room.clearRoomAllCacheData(findId)
 
-  const dpi = 'BROADCAST_VIDEO_PROFILE_720P_1' // 1280x720 (默认)
-  const layout = req.payload.layout || 'CANVAS_LAYOUT_PATTERN_FLOAT_6_5D' // 大屏铺满，一行5个悬浮于下面
-  const userId = master_user_id || room.sid
-  if (open) {
-    try {
-      // 启动旁路推流
-      await req.server.methods.paas.pushIlsAnother(room.paasInavId, room.paasLiveId, dpi, layout)
-    } catch (e) {
-      return Boom.serverUnavailable('启动旁路推流出错：' + e.message)
-    }
-
-    // 设置最大屏占比的流
-    if (maxScreenStream) await req.server.methods.paas.setMaxScreenStream(room.paasInavId, maxScreenStream).catch(e => e)
-
-    await req.server.methods.room.setRoomValue(roomId, 'live_start_at', Date.now())
-
-    // 发送自定义消息，通知客户端已经开始直播
-    const msg = { type: 'live_start', time: time || Date.now(), roomId, masterId: userId }
-    await req.server.methods.paas.sendMessage(room.paasImId, { type: 'service_custom', body: JSON.stringify(msg), third_party_user_id: userId })
-  } else {
-
-    // 关闭页面
-    if (req.payload.unload) {
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      let $masterId = await req.server.methods.room.getRoomValue(roomId, 'master_user_id')
-      let masterId = $masterId || room.sid
-      const list = await req.server.methods.paas.getIlsUsers(room.paasInavId).catch(e => [])
-      if (Array.isArray(list) && list.length) {
-        const masterInRoom = list.findIndex(item => item.third_party_user_id === masterId) >= 0
-        if (masterInRoom) return h.jdata({})
-      }
-    }
-
-    // 停止旁路推流
-    const res = await req.server.methods.paas.pushIlsAnotherStop(room.paasInavId).catch(e => e)
-    if (res instanceof Error) {
-      // 已关闭
-      if (res.data.code !== 60003) {
-        req.log('warn', `关闭旁路出错，${res.message}`)
-      }
-    }
-    await req.server.methods.room.setRoomValue(roomId, 'live_start_at', -1)
-
-    // 发送自定义消息，通知客户端已经停止直播
-    const msg = { type: 'live_stop', time: time || Date.now() }
-    await req.server.methods.paas.sendMessage(room.paasImId, { type: 'service_custom', body: JSON.stringify(msg), third_party_user_id: userId })
-  }
-  return h.jdata({})
-}
-
-// 根据token或roomId获取互动房间信息
-exports.init = async (req, h) => {
-  const sid = req.yar.id
-  const roomId = req.query.roomId || req.state.roomId
-  const title = req.query.title
-  if (!(roomId && sid || title)) return Boom.badRequest('参数错误，无法取得互动房间信息')
-  const sessionRoomId = req.state.roomId
-  let room
-
-  // 根据roomId取得互动房间信息
-  if (roomId) room = await req.server.methods.room.getRoom(roomId || sessionRoomId)
-  if (title) room = await req.server.methods.room.getRoomByTitle(title)
-  if (!room) return Boom.badRequest('互动房间信息不存在')
-
-  const result = { roomId: room.id, title: room.title, username: randomNickname() }
-  return h.jdata(result)
-    .state('roomId', `${result.roomId}`, { isHttpOnly: false, isSecure: false, isSameSite: 'Lax', path: '/' })
+  req.log('info', `重新开启互动房间, roomId:${roomId} accountId:${req.user && req.user.accountId}`)
+  const status = info.status
+  return h.jdata({ roomId: info.id, title: info.title, type: info.type, status })
 }
 
 // 进入互动房间需要的信息及权限分配
 // 注意，这里是demo，如果要在您自己的应用中使用，您需要实现自己的更为准确的权限管理
 // 特别需要注意的是，用户的权限是需要和房间进行关连的，即用户在a房间是创建者，在b房间不是
 exports.enter = async (req, h) => {
-  const { roomId, username, identity } = req.payload || {}
-  if (!roomId) return Boom.badRequest('房间名不能为空')
-  if (!username) return Boom.badRequest('用户昵称不能为空')
-  if (!INAV_IDENTITY[identity]) return Boom.badRequest('身份设置不正确')
+  /* @register method:post */
+  const { roomId, identity } = req.payload || {}
+  if (!roomId) return h.fail('房间id不能为空')
+  if (!utils.INAV_IDENTITY[identity]) return h.fail('身份设置不正确')
+  const accountId = req.user.accountId
+  const nickName = req.user.nickName || utils.randomNickname()
+  let tokenOptions = {}
 
-  const sid = req.yar.id
-  const sessionRoomId = req.state.roomId
-  const tokenOptions = {}
-  let room
-  let accountId
-  let token
+  const info = await req.server.methods.room.getRoomInfo(roomId)
+  if (!info) h.fail('互动房间不存在')
+  // status: 1未开播 2准备中 3直播中 4已结束
 
-  if (!req.state.sid) {
-    return Boom.badRequest('请检查您是否阻止了cookie')
+  req.log('info', `用户进入直播间(pre), roomId:${roomId} accountId:${req.user && req.user.accountId} identity:${identity}`)
+
+  const pIsOnline = req.server.methods.paas.checkUserOnline(info.paasImId, accountId)
+  const pIsMute = req.server.methods.paas.getMuteStat(info.paasImId, accountId).catch(() => null)
+  const pOnline = identity === utils.INAV_IDENTITY.guest ? req.server.methods.paas.getImOnlineUser(info.paasImId, 1, 100).catch(() => null): Promise.resolve(null)
+  const pIsKick = req.server.methods.room.isKickUser(roomId, accountId)
+
+  // 检查用户是否在黑名单里面（检查互动sdk的黑名单没必要，不需要管互动的黑名单）
+  // APP的SDK也切换至新SDK后，黑名单就可以走SDK了，这里暂时自行维护
+  const isKick = await pIsKick
+  if (isKick) {
+    // 如果主持人在黑名单则需要移除他（理论上是不会有的，但是demo数据有可能会混乱）
+    if (identity === utils.INAV_IDENTITY.master) await req.server.methods.room.kickAccountDel(roomId, accountId)
+    else return h.fail('该用户已被踢出')
   }
 
-  try {
-    room = await req.server.methods.room.getRoom(roomId)
-  } catch (e) {
-    return Boom.serverUnavailable('获取房间出错：' + e.message)
-  }
-  if (!room) return Boom.badRequest('互动房间不存在')
+  // 主持人检查，主持人只能有一个
+  if (identity === utils.INAV_IDENTITY.master) {
+    const isOnline = await pIsOnline
+    if (isOnline) {
+      req.log('warn', `当前账户已在直播间中, roomId:${roomId} accountId:${req.user && req.user.accountId} identity:${identity}`)
+      return h.fail('当前账户已在直播间中')
+    }
+    if (info.status === 4) {
+      req.log('warn', `该直播间已结束直播, roomId:${roomId} accountId:${req.user && req.user.accountId} identity:${identity}`)
+      return h.fail('该直播间已结束直播')
+    }
 
-  // 随机分配一个一个accountId （为了方便演示才随机分配的，实际操作中建议对应到用户，且不需要更新）
-  accountId = null // (req.state.user && req.state.user.userId)
-  // 恢复之前的用户id（根据用户名，主持人不需要）
-  if (identity !== INAV_IDENTITY.master) {
-    const userId = await req.server.methods.room.getRoomUserIdByNameAndIdentity(roomId, identity, username).catch(() => null)
-    if (userId) accountId = userId
+    // 尝试从其他人那里夺取直播间支持人（仅demo需要）
+    if (info.masterId && info.masterId !== accountId) {
+      // 防止两个不同的账户互抢主持人身份
+      if (info.status === 2 && (info.lastUse + 1000 * 60) > Date.now()) return h.fail('其他账户已作为主持人在直播间中')
+      else if (info.status === 2) {
+        const isOnline = await req.server.methods.paas.checkUserOnline(info.paasImId, info.masterId)
+        if (isOnline) return h.fail('其他账户已作为主持人在直播间中')
+      } else if (info.status === 3) return h.fail('该直播间名称已被使用')
+    }
+    // 保存主持人
+    if (info.masterId !== accountId) await req.server.methods.room.setRoomMaster(roomId, accountId)
+    // 已经开播，则不进行转换
+    if (info.status !== 3) await req.server.methods.room.setRoomLiveStat(roomId, 2, Date.now())
+  }
+  // 助理检查，助理只能有一个
+  else if (identity === utils.INAV_IDENTITY.helper) {
+    // id 是主持人的ID
+    if (info.masterId === accountId) {
+      req.log('warn', `该账户已作为主持人在直播间中, roomId:${roomId} accountId:${req.user && req.user.accountId} identity:${identity}`)
+      return h.fail('该账户已作为主持人在直播间中')
+    }
+    // 存在助理，且与现有助理id冲突
+    if (info.helperId && info.helperId !== accountId) {
+      // 现有助理是否在线
+      const isOnline = await req.server.methods.paas.checkUserOnline(info.paasImId, info.helperId)
+      if (isOnline) {
+        req.log('warn', `其他账户已作为助理在直播间中, roomId:${roomId} accountId:${req.user && req.user.accountId} identity:${identity}`)
+        return h.fail('其他账户已作为助理在直播间中')
+      }
+    }
+    // 现在设置新的助理id
+    if (info.helperId !== accountId) await req.server.methods.room.setRoomHelper(roomId, accountId)
   } else {
-    accountId = sid
-  }
-  if (!accountId) {
-    accountId = uuid.v4()
-  }
-
-  let $masterId = await req.server.methods.room.getRoomValue(roomId, 'master_user_id')
-  let masterId = $masterId || room.sid
-  let helperId = await req.server.methods.room.getRoomValue(roomId, 'helper_user_id')
-  let masterInRoom
-  let helperInRoom
-  if (helperId === masterId) helperId = null
-  // 检查人数 (观看端不限制人数)
-  if (identity !== INAV_IDENTITY.player) {
-    let list = []
-    // 查询在互动房间的人
-    const pi = req.server.methods.paas.getIlsUsers(room.paasInavId).catch(e => e)
-    const pm = req.server.methods.paas.getImOnlineUser(room.paasImId, 1, 100).catch(e => e)
-    try {
-      const res = await pi
-      if (Array.isArray(res) && res.length) {
-        if (res.length >= room.maxMember) return Boom.badRequest('该房间已满员')
-        list = list.concat(res.map(item => item.third_party_user_id))
-      }
-    } catch (e) {
-      return Boom.serverUnavailable('获取在线人数出错：' + e.message)
+    // 不能与现有的主持人助理账户冲突 (不论在不在线)
+    if ((info.helperId && info.helperId === accountId) || (info.masterId && info.masterId === accountId)) {
+      req.log('warn', `该账户已作为其他身份在直播间中, roomId:${roomId} accountId:${req.user && req.user.accountId} identity:${identity}`)
+      return h.fail('该账户已作为其他身份在直播间中')
     }
 
-    // 查询在房间的人
-    try {
-      const res = await pm
-      if (res) {
-        if (Array.isArray(res.list)) list = list.concat(res.list)
-        for (const [userId, $ctx] of Object.entries(res.context)) {
-          const ctx = safeParse($ctx)
-          if (!ctx) continue
-          if (ctx.identity === INAV_IDENTITY.master) { masterInRoom = true; continue }
-          if (ctx.identity === INAV_IDENTITY.helper) { helperInRoom = true; continue }
-          list.push(userId)
-        }
-      }
-    } catch (e) {
-      return Boom.serverUnavailable('获取在线人数出错：' + e.message)
-    }
+    // 嘉宾或助理不检查在线冲突
+    // 观众和嘉宾（不连接互动）不限制在线数量
+    // const isOnline = await pIsOnline
+    // if (isOnline) {
+    //   req.log('warn', `该账户已作为其他身份在直播间中, roomId:${roomId} accountId:${req.user && req.user.accountId} identity:${identity}`)
+    //   return h.fail('该账户已作为其他身份在直播间中')
+    // }
+  }
 
-    list = _.filter(_.uniq(list))
-    // 去掉主持人和助理
-    if (masterId) masterInRoom = masterInRoom || list.findIndex(item => item === masterId) >= 0
-    if (helperId) helperInRoom = helperInRoom || list.findIndex(item => item === helperId) >= 0
-    list = list.filter(item => item !== helperId && item !== masterId)
-
-    // 检查是否有主持人在线
-    if (identity === INAV_IDENTITY.master) {
-      if (masterInRoom) return Boom.badRequest('主持人已进入直播间，请选择其他角色')
-    } else if (identity === INAV_IDENTITY.helper) {
-      if (helperInRoom) return Boom.badRequest('助理已进入直播间，请选择其他角色')
-    } else {
-      // 去掉主持人和助理
-      if (list.length >= (room.maxMember - 2)) return Boom.badRequest('该房间已满员')
+  // 限制嘉宾在线人数
+  if (identity === utils.INAV_IDENTITY.guest) {
+    const maxMember = (info.maxMember || 2) - 2
+    const rs = await pOnline
+    const online = !Array.isArray(rs && rs.list) ? [] : rs.list.map(i => i.identity === utils.INAV_IDENTITY.guest ? i.accountId : null).filter(i => i)
+    if (online.length >= maxMember && online.indexOf(accountId) < 0) {
+      req.log('warn', `该直播间嘉宾人数超出限制, roomId:${roomId} accountId:${req.user && req.user.accountId} identity:${identity}`)
+      return h.fail('该直播间嘉宾人数超出限制')
     }
   }
 
-  if (identity === INAV_IDENTITY.master) {
-    // 只有是当前是创建者才有主播权限
-    if (!(accountId === room.sid || accountId === $masterId)) {
-      if (room.lastUse) {
-        return Boom.badRequest('此互动房间已被使用')
-      }
-      // 房间没有人在使用
-      const status = await req.server.methods.paas.getIlsStatus(room.paasInavId).catch(e => null)
-      // 这个房间正在推流中，不可被复用
-      if (status === 1) return Boom.badRequest('此互动房间你没有推流端权限')
-    }
-    // 把room设置为已使用
-    await req.server.methods.room.setRoomValue(roomId, 'lastUse', new Date()).catch(() => null)
-    await Rooms.update({ lastUse: new Date() }, { where: { id: room.id } })
-    // 主持人进入，则把结束直播状态变更为暂未开始
-    await req.server.methods.room.setRoomValue(roomId, 'live_start_at', 0).catch(() => null)
+  // 禁言状态
+  const isMute = await pIsMute
+
+  const room = {
+    roomId: info.id,
+    title: info.title,
+    type: info.type,
+    liveStartAt: info.liveStartAt,
+    status: info.status,
+    isVod: false,
+    hasVod: false,
+    isMute: !!(isMute && isMute.mute),
+    isMuteAll: !!(isMute && isMute.muteAll),
+  }
+  const sdk = {
+    appId: info.appId,
+    accountId: accountId,
+    nickName: nickName,
+    identity: identity,
+    paasLiveId: info.paasLiveId,
+    paasInavId: info.paasInavId,
+    paasImId: info.paasImId,
+    recordId: '',
+    token: '', // sdk的token
+    isVod: false,
+  }
+  const user = {
+    userId: accountId,
+    avatar: '',
+    accountId,
+    nickName,
+    identity,
   }
 
-  // 检查用户是否在黑名单里面
-  const ids = await req.server.methods.paas.getIlsKickList(room.paasInavId).catch(() => [])
-  if (Array.isArray(ids) && ids.indexOf(accountId) >= 0) {
-    if (identity !== INAV_IDENTITY.master) return Boom.badRequest('您已被踢出，无法进入')
-    // 主持人被设置为黑名单了（正式使用时不可能会出现），则取消
-    await req.server.methods.paas.resetIlsKickUser(roomId, accountId).catch(() => null)
-  }
-
-  if (identity === INAV_IDENTITY.master) {
-    accountId = sid
-    await req.server.methods.room.setRoomValue(roomId, 'master_user_id', accountId)
-  } else if (identity === INAV_IDENTITY.helper) {
-    await req.server.methods.room.setRoomValue(roomId, 'helper_user_id', accountId)
-  }
+  // 保存用户信息
+  await req.server.methods.room.saveRoomEnterUser(roomId, user)
 
   // 创建paas平台token，参见 http://www.vhallyun.com/docs/show/19
-  if (identity === INAV_IDENTITY.master) {
-    // 后端来操作推流和旁路，这里不需要给权限了
-    // tokenOptions.publish_stream = room.paasLiveId // 推流
-    // tokenOptions.publish_inav_another = room.paasInavId // 推旁路直播/结束推旁路直播
-  }
-  // 助理和推流端特有权限
-  if (identity === INAV_IDENTITY.master || identity === INAV_IDENTITY.helper) {
-    tokenOptions.kick_inav = room.paasInavId // 踢出互动房间/取消踢出互动房间
-    tokenOptions.publish_inav_stream = room.paasInavId // 推流(互动流)
-    tokenOptions.kick_inav_stream = room.paasInavId // 踢出某一路流
-    tokenOptions.askfor_inav_publish = room.paasInavId // 邀请推流/取消邀请推流
-    tokenOptions.audit_inav_publish = room.paasInavId // 审核申请上麦
-    tokenOptions.apply_inav_publish = room.paasInavId // 申请上麦
-  }
-  // 嘉宾特有权限
-  if (identity === INAV_IDENTITY.guest) {
-    tokenOptions.publish_inav_stream = room.paasInavId // 推流
-    tokenOptions.kick_inav = room.paasInavId // 踢人
-    tokenOptions.apply_inav_publish = room.paasInavId // 申请上麦
-  }
+  tokenOptions = Object.assign({}, utils.getTokenOption(identity, info.paasImId, info.paasLiveId, info.paasInavId))
+  // 为了demo的简洁性，增加以下权限
+  tokenOptions.kick_inav = info.paasInavId // 踢出互动房间/取消踢出互动房间
+  tokenOptions.publish_inav_stream = info.paasInavId // 推流(互动流)
 
-  // 在使用文档演示SDK获取access_token时需要
-  tokenOptions.operate_document = room.paasImId // 文档
-  tokenOptions.chat = room.paasImId // 聊天
-  tokenOptions.third_party_user_id = accountId
   // 最终向paas平台申请一个token
-  try {
-    token = await req.server.methods.paas.createPaasToken(tokenOptions)
-  } catch (e) {
-    return Boom.serverUnavailable('生成token失败：' + e.message)
-  }
+  sdk.token = await req.server.methods.paas.createPaasToken(accountId, tokenOptions)
 
-  try {
-    // 设置用户info
-    await req.server.methods.paas.setChannelUserInfo(accountId, username, DEFAULT_AVATAR)
-  } catch (e) {
-    return Boom.serverUnavailable('设置用户info失败：' + e.message)
-  }
-  const user = { avatar: '', username: username, userId: accountId, token, identity }
-  req.server.methods.room.setRoomUser(roomId, user).catch(() => null)
-  req.server.methods.room.setRoomUserIdOfNameAndIdentity(roomId, user.userId, user.identity, user.username).catch(() => null)
-
-  const liveStartAt = await req.server.methods.room.getRoomValue(roomId, 'live_start_at')
-
-  const $room = { ...room, appId: room.appId || req.server.app.paas.appId, liveStartAt }
-  return h.jdata({ room: $room, user })
-    .state('roomId', `${roomId}`, { isHttpOnly: false, isSecure: false, isSameSite: 'Lax', path: '/' })
+  req.log('debug', `用户进入直播间(post), roomId:${roomId} accountId:${req.user && req.user.accountId} identity:${identity} token: ${sdk.token} nickName:${user.nickName}`)
+  return h.jdata({ room, sdk, user })
 }
 
-// 在线用户列表
-exports.onlineUser = async (req, h) => {
-  const roomId = req.query.roomId || req.state.roomId
-  if (!roomId) return Boom.badRequest('roomId错误')
-  const limit = _.clamp(_.toSafeInteger(req.query.limit || '10'), 1, 500)
-  const page = _.clamp(_.toSafeInteger(req.query.page), 1, Number.MAX_SAFE_INTEGER)
+// 进入点播需要的信息
+exports.vod = async (req, h) => {
+  /* @register method:post,get auth:true */
+  const roomId = req.query.roomId || (req.payload && req.payload.roomId)
+  if (!roomId) return h.fail('房间id不能为空')
+  const nickName = req.user.nickName || utils.randomNickname()
+  let accountId = req.user.accountId || utils.flakeId().split('').reverse().join('')
 
-  let room
-  try {
-    room = await req.server.methods.room.getRoom(roomId)
-  } catch (e) {
-    return Boom.serverUnavailable('获取房间出错：' + e.message)
+  const room1 = await req.server.methods.room.getRoom(roomId)
+  const vod = await req.server.methods.room.getRoomVod(roomId)
+
+  if (!room1 && !vod) return h.fail('房间不存在')
+
+  // 判断暂未生成回放或回放正在生成
+  const room = {
+    roomId: roomId,
+    title: vod && vod.title || room1.title,
+    type: vod && vod.type || 1,
+    liveStartAt: 0,
+    status: vod ? 3 : 1, // 1直播未开始/结束 2录播生成中 3已生成录播
+    isVod: true,
   }
-  if (!room) return Boom.badRequest('互动房间不存在')
-  const channelId = room.paasImId
-  let data
-  try {
-    data = await req.server.methods.paas.getImOnlineUser(channelId, page, limit)
-    if (!data) return h.jlist([], 0, 0, 0)
-  } catch (e) {
-    return Boom.serverUnavailable('获取用户列表出错：' + e.message)
+  const sdk = {
+    appId: vod && vod.appId || room1.appId,
+    accountId: accountId,
+    nickName: nickName,
+    identity: utils.INAV_IDENTITY.player,
+    paasLiveId: vod && vod.paasLiveId || '',
+    paasInavId: '',
+    recordId: vod && vod.vodId || '',
+    paasImId: vod && vod.paasImId || '',
+    token: '', // sdk的token
+    isVod: true,
+    hasVod: true,
+  }
+  const user = {
+    userId: accountId,
+    avatar: '',
+    accountId,
+    nickName,
+    identity: utils.INAV_IDENTITY.player,
   }
 
-  const disableUsers = new Set(data.disable_users)
-  const total = data.total
-  const list = []
-  // const list = data.list
-  for (const [userId, ctx] of Object.entries(data.context)) {
-    const u = safeParse(ctx) || {}
-    list.push({
-      userId: userId,
-      identity: u.identity || INAV_IDENTITY.player,
-      nickName: u.nick_name || u.nickName || '',
-      avatar: u.avatar || '',
-      isImDisable: disableUsers.has(userId),
-    })
+  // 从ext覆盖
+  if (vod && vod.ext && vod.ext.overwrite) {
+    Object.assign(sdk, _.pick(vod.ext.overwrite, Object.keys(sdk)))
+    Object.assign(user, _.pick(vod.ext.overwrite, Object.keys(user)))
+    if(vod.ext.overwrite.accountId) accountId = vod.ext.overwrite.accountId
   }
 
-  return h.jlist(list, page, total, page + 1)
+  // token
+  if (!sdk.token && sdk.appId === req.server.app.paas.appId) {
+    // 创建paas平台token，参见 http://www.vhallyun.com/docs/show/19
+    const tokenOptions = utils.getTokenOption('', sdk.paasImId || '', '', '')
+    // 最终向paas平台申请一个token
+    sdk.token = await req.server.methods.paas.createPaasToken(accountId, tokenOptions)
+  }
+
+  user.accountId = accountId
+  user.userId = accountId
+  return h.jdata({ room, sdk, user })
 }
 
-// 让用户下麦 (您应该自己检查权限)
-exports.invaStreamDown = async (req, h) => {
-  const { roomId, targetId, userId, identity } = req.payload
-  if (!roomId) return Boom.badRequest('互动房间没有指定')
-  let room = await req.server.methods.room.getRoom(roomId)
-  if (!room) return Boom.badRequest('互动房间不存在')
+// 开始推流（旁路）(您应该自己检查权限)
+exports.another = async (req, h) => {
+  /* @register method:post */
+  const { open, maxScreenStream, time } = req.payload
+  const roomId = req.payload.roomId || req.query.roomId
+  if (!roomId) return h.fail('互动房间没有指定')
+  const info = await req.server.methods.room.getRoomInfo(roomId)
+  if (!info) return h.fail('互动房间不存在')
 
-  try {
-    // 发送自定义消息，通知客户端被下线
-    const msg = { type: 'inva_stream_down', roomId, targetId, identity }
-    await req.server.methods.paas.sendMessage(room.paasImId, { type: 'service_custom', body: JSON.stringify(msg), third_party_user_id: userId })
-  } catch (e) {
-    return Boom.serverUnavailable('发送指令失败：' + e.message)
-  }
+  // 判断用户是否有"推流"权限（仅限主持人）
+  // if (info.masterId && info.masterId !== req.user.accountId) return h.fail('没有推流权限')
 
-  return h.jdata({})
-}
+  const dpi = 'BROADCAST_VIDEO_PROFILE_720P_1' // 1280x720 (默认)
+  const layout = req.payload.layout || 'CANVAS_LAYOUT_PATTERN_FLOAT_6_5D' // 大屏铺满，一行5个悬浮于下面
+  const userId = req.user.accountId
 
-// 被踢出用户列表
-exports.roomKickList = async (req, h) => {
-  const roomId = req.query.roomId || req.state.roomId
-  if (!roomId) return Boom.badRequest('roomId错误')
-  let ids = []
-
-  const room = await req.server.methods.room.getRoom(roomId)
-  if (!room) return Boom.badRequest('互动房间不存在')
-  try {
-    ids = await req.server.methods.paas.getIlsKickList(room.paasInavId)
-  } catch (e) {
-    return Boom.serverUnavailable('获取列表出错：' + e.message)
-  }
-  const list = []
-  for (const userId of ids) {
-    const user = await req.server.methods.room.getRoomUser(roomId, userId).catch(() => null)
-    if (user) {
-      delete user.token
-      const u = Object.assign({ userId }, user)
-      if (!u.username) u.username = randomNickname()
-      list.push(u)
+  if (open) {
+    req.log('info', `开启旁路推流, roomId:${roomId} accountId:${userId}`)
+    try {
+      // 启动旁路推流
+      await req.server.methods.paas.pushIlsAnother(info.paasInavId, info.paasLiveId, dpi, layout)
+    } catch (e) {
+      return h.fail('启动旁路推流出错：' + e.message)
     }
+
+    // 设置最大屏占比的流
+    if (maxScreenStream) await req.server.methods.paas.setMaxScreenStream(info.paasInavId, maxScreenStream).catch(() => null)
+    await req.server.methods.room.setRoomLiveStat(roomId, 3, Date.now())
+
+    // 不是正在直播
+    if (info.status !== 3) {
+      await utils.wait(100)
+      // 发送自定义消息，通知客户端已经开始直播
+      const msg = {
+        roomId,
+        type: room.ROOM_EVENTS.LIVE_START,
+        targetId: utils.SPECIAL_ACCOUNT_ID.EVERYONE,
+        sourceId: utils.SPECIAL_ACCOUNT_ID.EVERYONE,
+        masterId: info.masterId || '',
+        identity: utils.INAV_IDENTITY.master,
+        deviceType: 0,
+        nickName: '',
+        avatar: '',
+        time: time || Date.now(),
+      }
+      await req.server.methods.paas.sendCustomMessage(info.paasImId, utils.SPECIAL_ACCOUNT_ID.SYSTEM, null, msg).catch(() => null)
+      // 发送开始旁路消息
+      liveBroadcastStartEmit(req, roomId, info.paasImId).catch(() => null)
+    }
+  } else {
+    req.log('info', `停止旁路推流, roomId:${roomId}`)
+    // 停止旁路推流
+    const res = await req.server.methods.paas.pushIlsAnotherStop(info.paasInavId).catch(e => e)
+    if (res instanceof Error) {
+      // 已关闭
+      if (res.data.code !== 60003) {
+        req.log('warn', `关闭旁路出错，${res.message}`)
+      }
+    }
+    await req.server.methods.room.setRoomLiveStat(roomId, 4, Date.now())
+
+    // 停顿一下
+    await utils.wait(100)
+    // 发送自定义消息，通知客户端已经开始直播
+    const msg = {
+      roomId,
+      type: room.ROOM_EVENTS.LIVE_STOP,
+      targetId: utils.SPECIAL_ACCOUNT_ID.EVERYONE,
+      sourceId: utils.SPECIAL_ACCOUNT_ID.EVERYONE,
+      masterId: info.masterId || '',
+      identity: utils.INAV_IDENTITY.master,
+      deviceType: 0,
+      nickName: '',
+      avatar: '',
+      time: time || Date.now(),
+    }
+    // { type: 'service_custom', body: JSON.stringify(msg), third_party_user_id: userId }
+    await req.server.methods.paas.sendCustomMessage(info.paasImId, utils.SPECIAL_ACCOUNT_ID.SYSTEM, null, msg).catch(() => null)
   }
-
-  return h.jlist(list, 1, list.length, 2)
-}
-
-// 踢出用户
-exports.kickUser = async (req, h) => {
-  const { roomId, userId } = req.payload
-  if (!roomId) return Boom.badRequest('互动房间没有指定')
-  if (!userId) return Boom.badRequest('用户id没有指定')
-  let room = await req.server.methods.room.getRoom(roomId)
-  if (!room) return Boom.badRequest('互动房间不存在')
-
-  let $masterId = await req.server.methods.room.getRoomValue(roomId, 'master_user_id')
-  let masterId = $masterId || room.sid
-  let helperId = await req.server.methods.room.getRoomValue(roomId, 'helper_user_id')
-
-  if (userId === masterId || userId === helperId) {
-    // why ???
-    return h.jdata({})
-  }
-
-  await new Promise(resolve => setTimeout(resolve, 500))
-  // 发送自定义消息
-  const msg = { type: 'kick_inav', targetId: userId, time: Date.now() }
-  await req.server.methods.paas.sendMessage(room.paasImId, { type: 'service_custom', body: JSON.stringify(msg), third_party_user_id: masterId })
-
   return h.jdata({})
 }
 
-// 取消踢出用户
-exports.unkickUser = async (req, h) => {
-  const { roomId, userId } = req.payload
-  if (!roomId) return Boom.badRequest('互动房间没有指定')
-  if (!userId) return Boom.badRequest('用户id没有指定')
-  let room = await req.server.methods.room.getRoom(roomId)
-  if (!room) return Boom.badRequest('互动房间不存在')
+// 直播中检查
+exports.checkLivein = async (req, h) => {
+  /* @register method:get */
+  const roomId = req.query.roomId
+  if (!roomId) return h.fail('互动房间没有指定')
+  const info = await req.server.methods.room.getRoomInfo(roomId)
+  if (!info) return h.jdata()
+  // if (info.masterId !== req.user.accountId) return h.jdata()
 
-  let $masterId = await req.server.methods.room.getRoomValue(roomId, 'master_user_id')
-  let masterId = $masterId || room.sid
+  const [ilsStatus, rs1] = await Promise.all([
+    req.server.methods.paas.getIlsStatus(info.paasInavId).catch(() => null),
+    req.server.methods.paas.getLssStreamStatus(info.paasLiveId).catch(() => null)
+  ])
 
-  // 发送自定义消息
-  const msg = { type: 'unkick_inav', targetId: userId, time: Date.now() }
-  await req.server.methods.paas.sendMessage(room.paasImId, { type: 'service_custom', body: JSON.stringify(msg), third_party_user_id: masterId })
-
-  return h.jdata({})
+  // ilsStatus: 0 无流 1 推流中
+  // 1 推流中 2 未推流或推流结束
+  const streamStatus = rs1.streamStatus
+  return h.jdata({ ilsStatus, streamStatus })
 }
 
-// report
+// 页面卸载检查
+exports.unload = async (req, h) => {
+  /* @register method:get */
+  const roomId = req.query.roomId
+  const event = req.query.event
+  if (!roomId) return h.fail('互动房间没有指定')
+  const info = await req.server.methods.room.getRoomInfo(roomId)
+  if (!info) return h.fail('互动房间不存在')
+  if (info.masterId !== req.user.accountId) return h.jdata()
+
+  req.log('info', `页面关闭, roomId:${roomId} accountId:${req.user && req.user.accountId}`)
+  await utils.wait(1000 * 10)
+  // 关闭页面
+  // await new Promise(resolve => setTimeout(resolve, 1000))
+  // let $masterId = await req.server.methods.room.getRoomValue(roomId, 'master_user_id')
+  // let masterId = $masterId || room.sid
+  // const list = await req.server.methods.paas.getIlsUsers(room.paasInavId).catch(e => [])
+  // if (Array.isArray(list) && list.length) {
+  //   const masterInRoom = list.findIndex(item => item.third_party_user_id === masterId) >= 0
+  //   if (masterInRoom) return h.jdata({})
+  // }
+}
+
 exports.report = async (req, h) => {
-  const roomId = req.payload && req.payload.roomId || req.query.roomId
-  if (roomId) {
-    req.log(['info', 'room', 'report'], Object.assign({}, req.query, req.payload))
-  }
-  return h.jdata({})
-}
-
-// 删除房间 (仅demo管理使用)
-exports.roomDelete = async (req, h) => {
-  if (!req.payload) return h.jdata({ })
-  if (!await demoAuth(req.server.app.paas.secretKey, req.query.time, req.query.sha1)) return h.jdata({ })
-  const ids = req.payload.ids
-  if (!(Array.isArray(ids) && ids.length)) return Boom.badRequest('roomId错误')
-  req.server.methods.task.addTask('room-clean-by-id', 'room-clean', Date.now() + 3000, { done: true, ids })
-  return h.jdata({ })
-}
-
-// 房间列表 (仅demo管理使用)
-exports.roomList = async (req, h) => {
-  if (!await demoAuth(req.server.app.paas.secretKey, req.query.time, req.query.sha1)) return h.jlist([], 0, 0, 0)
-  const limit = _.clamp(_.toSafeInteger(req.query.limit || '10'), 1, 50)
-  const page = _.clamp(_.toSafeInteger(req.query.page), 1, Number.MAX_SAFE_INTEGER)
-
-  const where = _.pick(req.query, ['sid', 'paasLiveId', 'paasInavId', 'paasImId', 'id'])
-  const offset = limit * (page - 1)
-  const order = [['id', 'desc']]
-  const { rows, count } = await Rooms.findAndCountAll({ where, order, limit, offset })
-
-  const sids = _.map(rows, 'sid')
-  let sessions = {}
-  if (sids.length) {
-    const rows = await Sessions.findAll({ where: { sid: sids } })
-    sessions = _.keyBy(rows, 'sid')
-  }
-
-  const rooms = []
-  for (const row of rows) {
-    const room = row.toJSON()
-    room.session = sessions[room.sid] && sessions[room.sid].toJSON()
-    rooms.push(room)
-  }
-
-  return h.jlist(rooms, page, count, page + 1)
-}
-
-// 房间列表 (仅demo管理使用)
-exports.roomLivein = async (req, h) => {
-  let rooms = []
-  if (!await demoAuth(req.server.app.paas.secretKey, req.query.time, req.query.sha1)) return h.jlist([], 0, 0, 0)
-
-  const paasLiveIds = await req.server.methods.paas.getLssLssPushing()
-  if (Array.isArray(paasLiveIds) && paasLiveIds.length) {
-    const lists = await Rooms.findAll({ where: { paasLiveId: paasLiveIds } })
-
-    const sids = _.map(lists, 'sid')
-    let sessions = {}
-    if (sids.length) {
-      const rows = await Sessions.findAll({ where: { sid: sids } })
-      sessions = _.keyBy(rows, 'sid')
-    }
-
-    for (const row of lists) {
-      const room = row.toJSON()
-      room.session = sessions[room.sid] && sessions[room.sid].toJSON()
-      rooms.push(room)
-    }
-  }
-  return h.jlist(rooms, 0, rooms.length, 0)
+  /* @register method:get,post auth:false */
+  return h.jdata()
 }

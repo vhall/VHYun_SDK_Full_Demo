@@ -5,13 +5,6 @@
 </template>
 
 <style lang="less">
-#app {
-  color: #fff;
-  min-height: 800px;
-  height: 100vh;
-  min-width: 1280px;
-  overflow: hidden;
-}
 body {
   -ms-overflow-style: none;
   overflow: -moz-scrollbars-none;
@@ -24,8 +17,19 @@ body::-webkit-scrollbar {
   visibility: hidden;
 }
 body{
+  background-color: #f4f8fe;
   /deep/ .el-select-dropdown.el-popper .popper__arrow{
     display: none;
   }
+}
+#app {
+  color: #fff;
+  min-height: 800px;
+  //height: 100vh;
+  min-width: 1280px;
+  overflow: hidden;
+  display: flex;
+  width: 100%;
+  height: 100%;
 }
 </style>

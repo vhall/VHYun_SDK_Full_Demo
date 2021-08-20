@@ -3,7 +3,7 @@ const _ = require('lodash')
 const {Op} = require('sequelize')
 const {Rooms} = require('../models')
 
-const oneday = 1000 * 3600 * 24
+const oneDay = 1000 * 3600 * 24
 
 async function findRoomByRange (start, end) {
   const where = { updatedAt: { [Op.between]: [start, end] } }
@@ -14,8 +14,8 @@ async function findRoomByRange (start, end) {
 async function roomClean(server, params) {
   const day = params && params.day || 7
   const range = params && params.range || 3
-  const end = new Date(Date.now() - oneday * day)
-  const start = new Date(end.getTime() - oneday * range)
+  const end = new Date(Date.now() - oneDay * day)
+  const start = new Date(end.getTime() - oneDay * range)
   const ids = Array.isArray(params.ids) ? params.ids : await findRoomByRange(start, end)
   for (const id of ids) {
     try {
@@ -28,9 +28,10 @@ async function roomClean(server, params) {
       }
       // if (room.paasLiveId) {}
 
-      await server.methods.room.destroyRoom(id)
-      if (room.paasLiveId) await server.methods.paas.deleteIls(room.paasLiveId).catch(() => null)
-      if (room.paasInavId) await server.methods.paas.deleteLss(room.paasInavId).catch(() => null)
+      await server.methods.room.destroyRoom(id, true)
+      if (room.paasLiveId) server.methods.paas.deleteIls(room.paasLiveId).catch(() => null)
+      if (room.paasInavId) server.methods.paas.deleteLss(room.paasInavId).catch(() => null)
+
       // if (room.paasImId) await server.methods.room.deleteChannel(room.paasImId).catch(() => null)
       server.log(['info', 'task', 'roomClean'], `destroy room ${id} success`)
       await new Promise(resolve => setTimeout(resolve, 200))

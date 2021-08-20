@@ -2,111 +2,98 @@
 const Inert = require('@hapi/inert')
 const _ = require('lodash')
 const path = require('path')
+const utils = require('../utils')
 const room = require('./room')
 const form = require('./form')
 const doc = require('./doc')
+const inav = require('./inav')
+const log = require('./log')
+const admin1 = require('./admin')
+const pages = require('./pages')
 const backend = require('./backend')
-// eslint-disable-next-line
-const favicon = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAD0klEQVRYCdVX2W+NQRTvX0KQiiV4ISIerEF4wYsnCRISwgMeeLPEkm5KQy2lNCWVtkRplWjRatTWhja0VQmp7/YuXe7W3t72LiO/me98M99yr15p0jjJ3JlvlnN+c+b8zszNmpGjseksWdNpHLb/XwBby33MSdpc48aRPv8e4VOGI3Gjz+rxlB74MTjhpJ+RsiN1w47j1Z2jhrFeXceH31Gjb1IA5uRpLJZIOhqgHZ59FWCuYIwXTzhuzM1pCnBjs3I1NhEXOu5/GckMwLqbHkOhtaHukHajHsf+R0Pc2KobUgfA0lxr7XgEM3M0ll0gy4JCF4vrHslvDtqUqcexodTDx/c8GDSwo201TN+OAGiQanU3Bx+LHdIY6sutIW4smUyyuQUubgy7JsF6db7adgRQ1hZmiWSShaIJvnBX1QDpYlvKvDZldd0i2hETpBznDkEcIB6o31o7Anjzc4wv7nALSp1s8BsAFhaKHaqKun2CMS2/ZLQj8iFggjrX2nYEoAVjfHHNN0EpeAQyOGrnM+JlLCaivbw9bBgDXSHIBVaj6rcNQHa+xt2PxYUtIuCadY981OQOScmKq25uCD+nGv1pjdEatbYBWH9L0ueQHnB9AeGRqk7B5+XFbrax1MPLsXqZkE40+I1+Gl900X5kaQHsfSjpg4BDUkJAQvJ0CpJHjK2naeysHEjrFZsHzin0Af/XlEiPHKgRFEQsTFZWXnNnBqBCp483LAJud7X0yOY7Xja/0MVe9EaMEhhLcCzBaMLoc4cEwGgsyRCkqsutbZsH3vUJ+qDG5NONMqHAI1YFFB8ARWOgI6RnID0FMd8GADuH3PssAg7UgvhG7BRUGXP9fcgA0K97oL5HgiJw1toEAO4lOfNSXCCUlJyuVJUxx58NcwBIxUjJkOJWCcpqmL5NAHDGJHSBUFKq7LBfqfsUxuyo8HEAoB/J0ToBiow51SYAiHKS1SUeprqY7nlVyfnXMj6WXennAHAdk2y/K0Cpa6xtEwDwHILHyOw8janvArrnVQXwCmR0XFxaGMttEjrQv6RIgFLXWNsmAHhsQHCG4WiCRSYExdC36bb9FkRqhnz1ymgnHaCn1ZjTtwkAnlupZN4FOwWH9IRU2yWjvV3XQU83J6NqnwmAPyJ3rAKhpISrGGeNslbJkEVv5SuJEtPTnogxl9agXqrHCoEwAaDOVPWTLnFEKji0D9eKaMeZ/01KP8krG3YyAoAHipPgUQpl21L8V6A1yIxglrrBjACQe0kh1YsviWgH71MJ7gV6sP4zAHXhVLUz8sBUGVX1TDuAPxws2Ygy2U90AAAAAElFTkSuQmCC', 'base64')
+
+function getHandlerRegisterInfo(prefix, name, handler){
+  /* @register method:get,post path:/admin/v1 */
+  if (typeof handler !== 'function') return
+  const match = (/\/*\s*@register\s+(.*)\*\//).exec(handler.toString())
+  if (!(match && match[0])) return
+  const obj = { method: ['get'], path: path.join(prefix, name), handler, options: {} }
+  const keys = ['method', 'path', 'vhost', 'handler', 'options', 'config']
+
+  const $obj = {}
+  for (const item of _.split(_.trim(match[1]), ' ')) {
+    let [key, value] = _.split(_.trim(item), ':', 2)
+    if (value === 'false') value = false
+    if (value === '') value = true
+    if (keys.indexOf(key) >= 0) $obj[key] = value
+    else if (key) obj.options[key] = value
+  }
+
+  if ($obj.path) obj.path = $obj.path
+  if ($obj.method) {
+    const method = _.filter(_.split($obj.method, ','))
+    if (method.length) obj.method = method
+  }
+  return obj
+}
 
 function $static(settings, server){
   const routes = []
   //  icon
-  routes.push({ method: 'get', path: '/favicon.ico', handler: (req, h) => h.response(favicon).type('image/x-icon') })
-  routes.push({
-    method: 'get',
-    path: '/main',
-    handler: function (request, h) {
-      return h.file(path.join(server.app.projectRoot, 'public/index.html'))
-    }
-  })
-  routes.push({
-    method: 'get',
-    path: '/{param*}',
-    handler: {
-      directory: {
-        path: path.join(server.app.projectRoot, 'public'),
-        index: true
-      }
-    }
-  })
-  const options = {}
+  routes.push({ method: 'get', path: '/favicon.ico', handler: (req, h) => h.response(utils.favicon).type('image/x-icon') })
+  // room
+  for (const name of Object.keys(pages)) {
+    let info = getHandlerRegisterInfo('/pages', name, pages[name])
+    if (!info) continue
+    const gen = info.options.gen
+    if (gen) info = pages[name](server)
+    if (!info) continue
+    if (!gen) info.options.auth = { mode: 'optional', strategy: 'api' }
+    routes.push({ ...info })
+  }
+
+  const options = { cors: true, auth: false }
   return { routes, options }
 }
 
 function v1(settings, server){
   const routes = []
+  const routeOptions = { auth: 'api' }
   const prefix = '/api/v1'
 
-  // 创建互动房间
-  routes.push({
-    method: ['post'],
-    path: prefix + '/room/create',
-    handler: room.create,
-    options: { cors: true }
-  })
-  // 获取互动房间信息
-  routes.push({
-    method: ['get'],
-    path: prefix + '/room/init',
-    handler: room.init,
-    options: { cors: true }
-  })
-  // 获取互动房间进入信息，token
-  routes.push({
-    method: ['post'],
-    path: prefix + '/room/enter',
-    handler: room.enter,
-    options: { cors: true }
-  })
-  // 设置推送旁路流
-  routes.push({
-    method: ['post'],
-    path: prefix + '/room/another',
-    handler: room.another,
-    options: { cors: true }
-  })
-  // 用户列表
-  routes.push({
-    method: 'get',
-    path: prefix + '/room/onlineUser',
-    handler: room.onlineUser,
-    options: { cors: true }
-  })
-  // 下麦
-  routes.push({
-    method: 'post',
-    path: prefix + '/room/invaStreamDown',
-    handler: room.invaStreamDown,
-    options: { cors: true }
-  })
-  routes.push({
-    method: 'post',
-    path: prefix + '/room/kickUser',
-    handler: room.kickUser,
-    options: { cors: true }
-  })
-  routes.push({
-    method: 'post',
-    path: prefix + '/room/unkickUser',
-    handler: room.unkickUser,
-    options: { cors: true }
-  })
-  // 被踢出列表
-  routes.push({
-    method: 'get',
-    path: prefix + '/room/roomKickList',
-    handler: room.roomKickList,
-    options: { cors: true }
-  })
+  // room
+  for (const name of Object.keys(room)) {
+    if (name === 'vod') continue
+    const info = getHandlerRegisterInfo(path.join(prefix, 'room'), name, room[name])
+    if (!info) continue
+    routes.push({ ...info })
+  }
 
-  // report
-  routes.push({
-    method: ['get', 'post'],
-    path: prefix + '/room/report',
-    handler: room.report,
-    options: { cors: true }
-  })
+  // room vod
+  const vod = getHandlerRegisterInfo(path.join(prefix, 'room'), 'vod', room.vod)
+  vod.options.auth = { mode: 'optional', strategy: 'api' }
+  routes.push({ ...vod })
+
+  // inav
+  for (const name of Object.keys(inav)) {
+    const info = getHandlerRegisterInfo(path.join(prefix, 'inav'), name, inav[name])
+    if (!info) continue
+    routes.push({ options: routeOptions, ...info })
+  }
+
+  // form
+  for (const name of Object.keys(form)) {
+    const info = getHandlerRegisterInfo(path.join(prefix, 'form'), name, form[name])
+    if (!info) continue
+    routes.push({ options: routeOptions, ...info })
+  }
+
+  // doc
+  for (const name of Object.keys(doc)) {
+    const info = getHandlerRegisterInfo(path.join(prefix, 'doc'), name, doc[name])
+    if (!info) continue
+    routes.push({ options: routeOptions, ...info })
+  }
 
   // 文档创建
   routes.push({
@@ -114,7 +101,7 @@ function v1(settings, server){
     path: prefix + '/doc/create',
     handler: doc.create,
     options: {
-      cors: true,
+      auth: 'api',
       payload: {
         output: 'stream',
         parse: false,
@@ -123,61 +110,23 @@ function v1(settings, server){
       }
     }
   })
-  // 文档列表
-  routes.push({
-    method: 'get',
-    path: prefix + '/doc/list',
-    handler: doc.list,
-    options: { cors: true }
-  })
 
-  // 表单列表
+  // rm log
   routes.push({
-    method: 'get',
-    path: prefix + '/form/list',
-    handler: form.list,
-    options: { cors: true }
-  })
-  // 表单创建
-  routes.push({
-    method: 'post',
-    path: prefix + '/form/create',
-    handler: form.create,
-    options: { cors: true }
-  })
-  // 表单创建
-  routes.push({
-    method: 'post',
-    path: prefix + '/form/delete',
-    handler: form.delete,
-    options: { cors: true }
-  })
-
-  //（仅demo管理使用）
-  routes.push({
-    method: 'post',
-    path: prefix + '/room/roomDelete',
-    handler: room.roomDelete,
-    options: { cors: true }
-  })
-  //（仅demo管理使用）
-  routes.push({
-    method: 'get',
-    path: prefix + '/room/roomList',
-    handler: room.roomList,
-    options: { cors: true }
-  })
-  //（仅demo管理使用）
-  routes.push({
-    method: 'get',
-    path: prefix + '/room/roomLivein',
-    handler: room.roomLivein,
-    options: { cors: true }
+    method: ['post', 'get'],
+    path: prefix + '/log/rm',
+    handler: log.rm,
+    options: {
+      auth: false
+    }
   })
 
   const options = {
-    routes: { cors: true }
+    routes: {},
+    auth: 'api',
+    cors: true
   }
+
   return { routes, options }
 }
 
@@ -197,12 +146,46 @@ function v1backend(settings, server){
   return { routes, options }
 }
 
+//（仅demo管理使用）
+function admin(settings, server){
+  const routes = []
+  const prefix = '/admin'
+
+  // room
+  for (const name of Object.keys(admin1)) {
+    const info = getHandlerRegisterInfo(prefix, name, admin1[name])
+    if (!info) continue
+    routes.push({ ...info })
+  }
+
+  routes.push({
+    method: 'get',
+    path: prefix + '/log',
+    handler: log.log,
+    options: {
+      auth: { mode: 'optional', strategy: 'admin' }
+    }
+  })
+
+  const options = {
+    cors: true,
+    auth: 'admin'
+  }
+  return { routes, options }
+}
+
 // 路由注册辅助函数（使用插件的方式注册路由）
 function routerPkgRegister(server, rgen, settings){
   const { routes, options } = rgen(settings, server)
   const plugin = {
     pkg: { name: 'route_reg_' + rgen.name },
-    register: server => server.route(routes)
+    register: (server, options) => {
+      const map = route => {
+        route.options = Object.assign(_.pick(options, ['cors', 'auth']), route.options)
+        return route
+      }
+      server.route(routes.map(map))
+    }
   }
   const _options = _.assign({}, options, settings || {})
   return server.register({ plugin, options: _options })
@@ -219,5 +202,7 @@ exports.plugin = {
     await routerPkgRegister(server, v1, options)
     // 注册backend路由
     await routerPkgRegister(server, v1backend, options)
+    // admin
+    await routerPkgRegister(server, admin, options)
   }
 }

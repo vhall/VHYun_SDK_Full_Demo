@@ -117,9 +117,11 @@ export default {
         if (this.appendToBody) {
           document.body.appendChild(this.$el)
         }
+        document.body.style.overflow = 'hidden'
       } else {
         // this.$el.removeEventListener('scroll', this.updatePopper)
         if (!this.closed) this.$emit('close')
+        document.body.style.overflow = ''
         // if (this.destroyOnClose) {
         //   this.$nextTick(() => {
         //     this.key++
@@ -189,7 +191,9 @@ export default {
       }
     }
   },
-
+  beforeDestroy() {
+    document.body.style.overflow = ''
+  },
   destroyed() {
     // if appendToBody is true, remove DOM node after destroy
     if (this.appendToBody && this.$el && this.$el.parentNode) {

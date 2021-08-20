@@ -1,30 +1,95 @@
-import { safeParse } from '@hapi/bourne'
+import { getProxy, safeParse } from '@/utils/index'
 
 // 实例化聊天sdk，注意聊天sdk应优先初始化
 export async function initChat(option){
-  const { message, disable_all, disable } = await new Promise((resolve, reject) => window.VhallChat.createInstance(option, resolve, reject))
-  return { chat: message, disable_all, disable }
+  const rs = await VhallChat.createInstance(option)
+  const disableAll = typeof rs.disable_all !== 'undefined' ? rs.disable_all : rs.disableAll
+  const disable = typeof rs.disable !== 'undefined' ? rs.disable : rs.disableAll
+  const chat = rs.message ? rs.message : rs
+  return { chat, disableAll, disable }
 }
 
 // 实例化互动sdk
 export async function initRTC(option){
-  const { vhallrtc, currentStreams } = await new Promise((resolve, reject) => window.VhallRTC.createInstance(option, resolve, reject))
-  return { rtc: vhallrtc, currentStreams }
+  try {
+    // if (typeof useMsgV4 === 'boolean' && useMsgV4 === true) msgEventProxy({ name: 'vhall-jssdk-interaction', version: '2.2.4' }, function (msg, event, cb) {})
+    if (typeof useMsgV4 === 'boolean' && useMsgV4 === true) msgEventProxy({ name: 'vhall-jssdk-interaction', version: '2.3.1' }, function (msg, event, cb) {})
+    const { vhallrtc, currentStreams } = await new Promise((resolve, reject) => window.VhallRTC.createInstance(option, resolve, reject))
+    return { rtc: vhallrtc, currentStreams }
+  } catch (e) {
+    console.error(e)
+  }
 }
 
 // 实例化文档sdk
 export async function initDoc(option){
-  const doc = await new Promise((resolve, reject) => {
-    const doc = window.VHDocSDK.createInstance(option, () => {
-      resolve(doc)
-    }, reject)
+  if (typeof useMsgV4 === 'boolean' && useMsgV4 === true){
+    msgEventProxy({ name: 'vhall-jssdk-doc', version: '3.1.5' }, function (msg, event, cb) {
+      msg.on('document', function (ev) {
+        cb(docMsgTr(ev))
+      })
+    })
+  }
+
+  let doc
+  const promise = new Promise((resolve, reject) => {
+    doc = window.VHDocSDK.createInstance(option, () => resolve(doc), reject)
   })
-  // 使用Object.seal密封对象，避免vue深度最终sdk实例内部，造成不必要的麻烦
+  // window['VhallMsg'] = VhallMsg
+  await promise
   return doc
 }
 
+function docMsgTr(ev) {
+  const o = {
+    msg_id: ev.msgId,
+    app_id: ev.appId,
+    channel: ev.channelId,
+    service_type: 'service_document',
+    msg_source: 'prefix01',
+    sender_id: ev.sourceId,
+    bu: '1',
+    pv: 0,
+    uv: 0,
+    context: JSON.stringify(ev.context),
+    data: JSON.stringify(ev.data),
+    date_time: "2021-06-13 03:41:29",
+  }
+  return o
+}
+
+function msgEventProxy(sdk, callback) {
+  // proxy doc over msg v4
+  const VhallMsg = window.VhallMsg
+  if (!VhallMsg) return Promise.reject()
+
+  function fkInstance (success, fail) {
+    return function (rs) {
+      rs.info = { document_server: 'https://cnstatic01.e.vhall.com/document', log_server: '' }
+      const rsp = getProxy(rs, {
+        connect: null,
+        addEventListener: function () {
+          return function (e, cb) {
+            callback(rs, e, cb)
+          }
+        }
+      })
+      rs.join.call(rs).then(function () {}, fail)
+      return success ? success(rsp) : rsp
+    }
+  }
+  window['VhallMsg'] = getProxy(VhallMsg, { createInstance: function (origin) {
+      window['VhallMsg'] = VhallMsg
+      return function (option, success, fail) {
+        option.sdk = sdk
+        origin(option, fkInstance(success, fail), fail)
+      }
+    }})
+
+}
+
 export function getStreamsInfo(rtc) {
-  if (!rtc) return null
+  if (!rtc) return []
   const { local: { user }, remote: { users } } = rtc.getRoomInfo()
   const lists = []
   // 本地 & 远程

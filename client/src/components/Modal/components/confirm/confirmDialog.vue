@@ -12,8 +12,8 @@
       <span>{{ content }}</span>
     </div>
     <div class="footer">
-      <button class="cancel" @click="close(0)">取消</button>
-      <button class="success" @click="close(1)">确定{{ countdown && leftSecStr ? `(${leftSecStr})` : '' }} </button>
+      <button class="cancel" @click="close(0)">{{ closeText || '取消' }}</button>
+      <button class="success" @click="close(1)">{{ confirmText || '确定' }}{{ countdown && leftSecStr ? `(${leftSecStr})` : '' }} </button>
     </div>
   </VhDialog>
 </template>
@@ -22,7 +22,7 @@
 import VhDialog from '../../src/component'
 export default {
   name: 'ConfirmDialog',
-  props: ['title', 'content', 'onClose', 'closeOnClickModal', 'countdown'],
+  props: ['title', 'content', 'onClose', 'closeOnClickModal', 'countdown', 'closeText', 'confirmText'],
   components: { VhDialog },
   data: () => ({
     closeAt: 0,

@@ -9,6 +9,13 @@ export async function createLocalStream(rtc, data = {}){
   el.id = 'local-stream-' + i++
   document.body.appendChild(el)
   const videoCodec = data.codecs ?? undefined
+
+  let profile = {}
+  if (typeof data.profile === 'string') profile = VhallRTC[data.profile]
+  profile = Object.assign({}, profile, VhallRTC && VhallRTC.RTC_VIDEO_PROFILE_720P_16x9_M || {})
+
+  // 火狐对profile支持有问题
+  if (navigator.userAgent.indexOf('Firefox/') >= 0) profile = {}
   const opt = {
     videoNode: el.id,
     audio: data.audio ?? true,
@@ -21,7 +28,7 @@ export async function createLocalStream(rtc, data = {}){
     simulcast: data.simulcast ?? true,
     audioDevice: data.audioDevice,
     videoDevice: data.videoDevice,
-    profile: data.profile,
+    profile: profile,
     attributes: data.attributes,
     videoCodec
   }
@@ -32,7 +39,13 @@ export async function createLocalStream(rtc, data = {}){
     streamId = data.streamId
     rtc.stopStream({ streamId })
   } catch (e) {
+    const t = e?.data?.error?.type
+    if (t === 'access-denied') {
+      if (opt.speaker) throw new Error('桌面共享已取消')
+      else throw new Error('设备捕获已取消')
+    }
     const err = new Error(e.message)
+
     err.code = e.code
     err.data = e.data
     throw err
@@ -48,5 +61,5 @@ export async function createLocalStream(rtc, data = {}){
   }
 
   el.remove()
-  return { streamId, audio, video }
+  return { audioDevice: data.audioDevice, videoDevice: data.videoDevice, streamId, audio, video }
 }

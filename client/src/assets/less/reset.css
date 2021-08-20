@@ -44,6 +44,9 @@ video {
   margin: 0;
   padding: 0;
 }
+video:focus {
+  outline: none;
+}
 h1,
 h2,
 h3,
@@ -107,7 +110,6 @@ input::-ms-clear {
 }
 body {
   font-family: Helvetica Neue,Helvetica,PingFang SC,Hiragino Sans GB,Microsoft YaHei,微软雅黑,Arial,sans-serif;
-  background: #fff;
 }
 a {
   text-decoration: none;
@@ -155,4 +157,9 @@ body {
 }
 img:not([src]),img[src=""]{
   opacity: 0;
+}
+#myVodNode {
+  position: absolute;
+  top: -9999px;
+  left: -9999px;
 }

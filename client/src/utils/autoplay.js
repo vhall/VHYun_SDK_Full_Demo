@@ -64,7 +64,7 @@ export const videoAutoPlaySupport = async function videoAutoPlaySupport () {
   setTimeout(function() {
     elem.addEventListener('playing', testAutoplay, false)
     timeout = setTimeout(testAutoplay, waitTime)
-  }, 10000)
+  }, 2000)
 
   return ret
 }
@@ -98,6 +98,6 @@ export const videoAutoPlay = async function videoAutoPlay (videoNode, mute) {
   window.addEventListener('click', unmuted)
 }
 
-
-
-
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('DOMContentLoaded', videoAutoPlaySupport)
+}

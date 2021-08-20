@@ -6,8 +6,10 @@ const fs = require('fs')
 const _ = require('lodash')
 const path = require('path')
 const util = require('util')
+const {wait} = require('./utils')
 const Package = require('../package.json')
 const projectRoot = path.resolve(__dirname, '../')
+Date.prototype.toJSON = function () { return this.valueOf() }
 const corsOpt = {
   additionalHeaders: ['cache-control', 'pragma', 'upgrade-insecure-requests', 'origin', 'content-type', 'authorization'],
   credentials: true
@@ -48,6 +50,42 @@ async function stepTls(conf){
   Config.server.tls = tls
 }
 
+async function setupEnv(srv, configs) {
+  // env
+  srv.app.paas = configs.paas
+  srv.app.demoMode = demoMode
+  srv.app.projectRoot = projectRoot
+  const selfUri = srv.info.uri
+
+  // 强制锁定到测试分支
+  if (!configs.host) {
+    const head = await util.promisify(fs.readFile)(path.join(projectRoot, '../.git/HEAD'), { encoding: 'utf8' }).catch(() => '')
+    if (head) {
+      if (head.indexOf('/test') >= 0) configs.getconfig.isDev = true
+    }
+  }
+
+  // local
+  if (configs.host) {
+    srv.app.hostSdk = configs.host.hostSdk || 'https://static.vhallyun.com'
+    srv.app.hostStatic = configs.host.hostStatic || 'http://localhost:8080'
+    srv.app.hostSite = configs.host.hostSite || selfUri
+  }
+
+  // dev
+  else if (configs.getconfig.isDev) {
+    srv.app.hostSdk = 'https://static.vhallyun.com'
+    srv.app.hostSite = 'https://test-demo.vhallyun.com'
+    srv.app.hostStatic = 'https://t-static01-open.e.vhall.com/jssdk/vhall-jssdk-full-demo'
+  }
+
+  else {
+    srv.app.hostSdk = 'https://static.vhallyun.com'
+    srv.app.hostSite = 'https://demo.vhallyun.com'
+    srv.app.hostStatic = 'https://static.vhallyun.com/jssdk/vhall-jssdk-full-demo'
+  }
+}
+
 async function init(){
   const configs = _.cloneDeep(Config)
   demoMode = configs.database && configs.database.dialect === 'sqlite'
@@ -60,7 +98,13 @@ async function init(){
   }
 
   // 服务器配置，演示模式下使用内存缓存（注意，不要将演示模式用于任何正式环境）
-  const options = { routes: { cors: corsOpt } }
+  const options = {
+    routes: {
+      cors: corsOpt,
+      security: { hsts: false, xframe: 'sameorigin', xss: true, noOpen: true, noSniff: true },
+    },
+    state: { ignoreErrors: true, encoding: 'none' },
+  }
   options.load = { sampleInterval: 500, concurrent: 500, maxEventLoopDelay: 3000 }
   options.operations = { cleanStop: false }
   if (!demoMode && configs.redis && configs.redis.host) options.cache = { provider: { constructor: CatboxRedis, options: configs.redis } }
@@ -68,14 +112,15 @@ async function init(){
   srv = Hapi.server(Object.assign(configs.server, options))
 
   // env
-  srv.app.paas = configs.paas
-  srv.app.demoMode = demoMode
-  srv.app.projectRoot = projectRoot
+  await setupEnv(srv, configs)
+
+  // 初始化数据库连接
+  await srv.register({ plugin: require('./plugins/log'), options: configs.logs })
 
   // 初始化数据库连接
   await srv.register({ plugin: require('./plugins/db'), options: configs.database })
   // session设置
-  await srv.register({ plugin: require('./plugins/session'), options: configs.session })
+  await srv.register({ plugin: require('./plugins/auth'), options: configs.auth })
   // paas注册method调用
   await srv.register({ plugin: require('./plugins/paas'), options: configs.paas })
   // 注册定时任务
@@ -84,6 +129,8 @@ async function init(){
   await srv.register({ plugin: require('./plugins/jdata-toolkit'), options: {} })
   // 注册room操作方法
   await srv.register({ plugin: require('./plugins/room'), options: {} })
+  // 注册
+  await srv.register({ plugin: require('./plugins/tiny-cache'), options: {} })
 
   // 演示模式，序列化/反序列化cache数据
   if (demoMode) await srv.register({ plugin: require('./plugins/memory-serialize'), options: {} })
@@ -130,9 +177,12 @@ async function start(){
 
   async function shutdown () {
     process.stdout.write('shutdown app...\n')
-    await srv.stop()
-    await new Promise(resolve => setTimeout(resolve, 100))
-    process.exit()
+    process.off('SIGINT', shutdown)
+    process.off('SIGTERM', shutdown)
+    srv.stop()
+    await wait( 200)
+    process.exit(0)
+    process.abort()
   }
 
   // 注册停止服务器事件

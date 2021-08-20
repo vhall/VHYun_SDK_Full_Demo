@@ -31,9 +31,8 @@ internals.connection = function (settings, projectRoot, log){
     isolationLevel: Transaction.ISOLATION_LEVELS.REPEATABLE_READ,
     native: true,
     dialectOptions: {
-      // 雪花id已经缩短至53位，不需要BigNumber
-      // supportBigNumbers: true,
-      // bigNumberStrings: true
+      supportBigNumbers: true,
+      bigNumberStrings: true
     },
     define,
     pool
@@ -75,12 +74,12 @@ internals.connection = function (settings, projectRoot, log){
 exports.plugin = {
   pkg: { name: 'db' },
   register: async function (server, options){
-    const log = sql => server.log('info', sql)
+    const log = (sql, opt) => server.log(['info', 'sequelize'], sql)
     const db = internals.connection(options, server.app.projectRoot, log)
     // 验证数据库连接
     await db.authenticate()
     // 初始化模型
-    models.init(db)
+    models.init(db, db.options.dialect === 'mysql')
     // 注册db对象访问
     server.decorate('request', 'db', () => db, { apply: true })
     server.decorate('server', 'db', db, { apply: true })

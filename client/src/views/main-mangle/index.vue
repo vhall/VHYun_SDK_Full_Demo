@@ -1,0 +1,1032 @@
+<template>
+  <div class="home">
+    <MainHeader :liveChange="liveChange"/>
+    <div class="home-content side" :class="{ sm2: $store.state.smChange }">
+      <!-- 主持助理侧边栏-->
+      <MainSide @openShare="openDesktopShare" @closeShare="closeDesktopShare"/>
+
+      <!-- 主内容-->
+      <MainContent/>
+
+      <!-- 右上播放-->
+      <div class="user-header">
+        <MainSmallWindow/>
+      </div>
+
+      <!-- 右下用户列表-->
+      <MainUser/>
+    </div>
+  </div>
+</template>
+
+<script>
+import {safeParse} from '@/utils'
+import * as api from '@/common/api'
+import {createLocalStream} from '@/utils/stream'
+import {initRTC} from '@/utils/sdk'
+import {inavApi, roomApi, rsApi} from '@/common/api'
+import {BUS_CUSTOM_EVENTS, BUS_EVENTS, BUS_LOCAL_EVENTS} from '@/common/contant'
+import {
+  IDENTITY,
+  isScreenShareSupported,
+  isSecure,
+  promisify,
+  requestAccessPermissionsAndTip,
+  wait
+} from '@/utils'
+import {Bus} from '@/message/bus'
+import VhDialog from '@/components/Modal'
+import DeviceDialogCtor from '@/components/Modal/components/device'
+import ConfirmDialogCtor from '@/components/Modal/components/confirm'
+import {createStore} from '@/store'
+import MainHeader from './MainHeader'
+import MainUser from './MainUser'
+import MainSide from './MainSide'
+import MainContent from './MainContent'
+import {rtcListen} from '../shard/sdk'
+import MainSmallWindow from './MainSmallWindow'
+
+export default {
+  name: 'Main',
+  components: {MainHeader, MainUser, MainContent, MainSide, MainSmallWindow},
+  props: ['viewData', 'store'],
+  data: () => ({
+    IDENTITY: IDENTITY,
+    rtc: null,
+    deviceSelect: 0,
+    deviceSelectMust: false,
+    attributes: null,
+    restoreLive: false,
+    autoPublish: false,
+    disableInvaApply: false,
+  }),
+  computed: {
+    hasOp: function () {
+      return this.$store.getters.hasOp
+    },
+    isMaster: function () {
+      return this.$store.getters.isMaster
+    },
+    chat: function () {
+      return this.$store.getters.chat
+    },
+    livein() {
+      return this.$store.getters.livein
+    },
+    isVod() {
+      return this.$store.getters.isVod
+    }
+  },
+  beforeCreate() {
+    this.$store = createStore()
+    this.$bus = new Bus()
+    this.$once('hook:beforeDestroy', () => this.$bus.destroy())
+    this.$bus.vm = this
+    this.$bus.store = this.$store
+    if (process.env.NODE_ENV !== 'production') {
+      window.store = this.$store
+      window.vm = this
+    }
+  },
+  async mounted() {
+    let roomId, identity, viewData, isVod
+    identity = this.$store.state.user.identity
+    roomId = this.$route.params.roomId
+    viewData = this.viewData // $route.matched[0].props['viewData']
+    isVod = viewData.room.isVod
+    // 直播进行中
+    this.restoreLive = viewData.room.status === 3 // && pageIsReload()
+    if (!isSecure()) return this.$message.error('请使用https访问，否则无法使用互动工具')
+    await this.$store.commit('setRoomEnterData', viewData)
+    inavApi.roomId = roomId
+    await this.setupBusOption()
+    await this.addExitListener()
+    await this.addInavListener()
+    try {
+      await this.$bus.init()
+    } catch (e) {
+      if (!isVod) return this.$message.error('消息sdk初始化失败')
+      roomApi.report(roomId, e)
+    }
+    // 提前请求设备，避免使用互动SDK时再请求设备
+    if (!isVod) {
+      try {
+        await this.requestRtcAccess()
+      } catch (e) {
+        return this.$message.error('您需要先在左上角同意访问摄像头和麦克风才可使用互动工具')
+      }
+    }
+
+    await this.$nextTick()
+    // 主持人，初始化rtc
+    if (!isVod && this.isMaster) {
+      this.$store.state.rtc = await this.tryInitAndSetRtc()
+    }
+    // 助理，初始化rtc
+    if (!isVod && this.$store.state.user.identity === IDENTITY.helper) {
+      this.$store.state.rtc = await this.tryInitAndSetRtc()
+    }
+    // 进入房间
+    await this.enterRoomStart(roomId)
+  },
+  methods: {
+    // 退出事件
+    async addExitListener() {
+      if (this.isVod) return
+      if (!this.isMaster) return
+      const roomId = this.$store.getters.roomId
+      window.addEventListener('beforeunload', event => {
+        if (!this.$store.getters.livein) return
+        // 直播中，弹出提示
+        event.preventDefault()
+        event.returnValue = '正在直播中，这将会关闭直播'
+        return false
+      })
+      window.addEventListener('unload', event => {
+        if (!this.$store.getters.livein) return
+        api.roomApi.unload(roomId)
+        this.destroySDK()
+      })
+    },
+    async requestRtcAccess() {
+      await requestAccessPermissionsAndTip(() => {
+        this.$message.error('请点击左上角允许网页获取摄像头及麦克风')
+      }, () => {
+        // 未能获取到设备（被拒绝）
+        this.$message.error('请点设置允许网页获取摄像头，并刷新网页，否则无法正常使用')
+      })
+    },
+    async setupBusOption() {
+      const user = this.$store.getters.getUser
+      const sdk = this.$store.getters.getSdkOption
+      const context = {nick_name: user.nickName, avatar: user.avatar, identity: user.identity}
+      const option = {
+        appId: sdk.appId,
+        accountId: sdk.accountId,
+        token: sdk.token,
+        channelId: sdk.paasImId,
+        identity: sdk.identity,
+        context: context,
+        hide: false
+      }
+      this.$bus.setOption(option)
+    },
+    // 事件监听（上下麦、表单填写等）
+    async addInavListener() {
+      const self = this
+      const bus = this.$bus
+
+      function onBus(event, fn) {
+        const $fn = fn.bind(self)
+        bus.on(event, $fn)
+        self.$once('hook:beforeDestroy', () => bus.off(event, $fn))
+      }
+
+      // 房间异常断开
+      this.$root.$on('EVENT_ROOM_EXCDISCONNECTED', this.onExcdisconnected.bind(this))
+
+      // 设置的设备更改
+      this.$root.$on(BUS_LOCAL_EVENTS.SETTINGS_CHANGE, () => {
+        // 没有流
+        if (!this.$store.getters.hasMeStreamPublish) return
+        this.changeDevice()
+      })
+
+      // 初始化
+      onBus(BUS_LOCAL_EVENTS.CHAT_INIT, function () {
+        this.$store.state.chat = this.$bus.chat
+      })
+
+      // 聊天
+      onBus(BUS_EVENTS.CHAT, function (chat) {
+        this.$root.$emit(BUS_LOCAL_EVENTS.INVA_CHAT, chat)
+      })
+      !this.isVod && onBus(BUS_CUSTOM_EVENTS.LIVE_START, async function () {
+        await this.$nextTick()
+        await wait(100)
+        this.$root.$emit('startInitDoc')
+      })
+      !this.isVod && onBus(BUS_CUSTOM_EVENTS.LIVE_START, async function () {
+        if (this.$store.getters.livein) {
+          console.log('直播继续推流')
+        }
+        else this.$message('直播已开始')
+      })
+      !this.isVod && onBus(BUS_CUSTOM_EVENTS.LIVE_STOP, function () {
+        this.$store.state.liveStatus = 4
+        if (!this.$store.getters.livein) return
+        this.$message('直播已结束')
+      })
+      !this.isVod && onBus(BUS_CUSTOM_EVENTS.LIVE_START_ANOTHER, function () {
+        if (this.$store.getters.livein) {
+          console.log('直播继续推流')
+        }
+        else console.log('直播已开始旁路')
+      })
+      !this.isVod && onBus(BUS_CUSTOM_EVENTS.LIVE_STOP_ANOTHER, function () {
+        console.log('直播已结束旁路')
+        if (!this.$store.getters.livein) return
+      })
+
+      // 主持人
+      this.isMaster && onBus(BUS_CUSTOM_EVENTS.LIVE_STOP_ANOTHER, async function () {
+        await wait(100)
+        // 没有在直播，则不为异常断开
+        if (!self.$store.getters.livein) return
+        if (self.$store.state.liveChanging) return
+        this.$message.error('旁路直播流异常断开')
+        await self.onExcdisconnected()
+        const rs = await roomApi.checkLivein(self.$store.getters.roomId)
+        if (rs && rs.streamStatus !== 1) self.$store.dispatch('setAnotherPush', true)
+      })
+
+      // 资源更新
+      onBus(BUS_CUSTOM_EVENTS.RESOURCE_CHANGE, function (ev) {
+        // const resource = ev.data.resource
+        // const change = ev.data.change
+        // const data = ev.data.data
+        this.$root.$emit(BUS_LOCAL_EVENTS.RESOURCE_CHANGE, ev.data)
+
+        const resource = ev.data.resource
+        const change = ev.data.change
+        const data = ev.data.data
+        if (resource === 'inav' && change === 'add' && data && data.type === 2) {
+          this.$store.commit('setInavInviterStat', { userId: data.accountId })
+        }
+      })
+    },
+    // 进入互动房间第一步
+    async enterRoomStart(roomId) {
+      const self = this
+      // 如果是恢复互动，询问是否继续推流
+      if (!this.isVod && this.restoreLive && this.isMaster) {
+        const onClose = async (ok) => {
+          if (!ok) {
+            roomApi.another(roomId, false).catch(() => null)
+            await wait(50)
+            return self.$router.push({name: 'home'})
+          }
+          this.$root.$emit('startInitDoc')
+          await self.invaPublishMaster()
+        }
+        const opt = {title: '继续直播', closeText: '结束直播', confirmText: '继续直播', content: '直播尚未结束，是否继续直播？', onClose}
+        VhDialog.open(ConfirmDialogCtor, this, opt)
+        return
+      }
+      await wait(50)
+      // 否则创建本地流，然后推流，不旁路
+      if (!this.isVod && this.isMaster) {
+        const rs = await this.tryCreateLocalStream(true)
+        if (rs) this.$store.commit('setLocalStream', {streamId: rs.streamId, audio: rs.audio, video: rs.video})
+      }
+
+      this.$root.$emit('startInitDoc')
+    },
+
+    // 房间异常断开
+    async onExcdisconnected() {
+      roomApi.report(this.$store.getters.roomId, 'room excdisconnected')
+      await wait(100)
+      if (!this.livein) return
+      if (this.reInitRtcing) return
+      this.reInitRtcing = true
+      try {
+        await this.$store.dispatch('checkLocalStream')
+        this.reInitRtcing = false
+        // return
+      } catch (e) {
+        console.error('onExcdisconnected', e)
+      }
+
+      console.warn('房间异常断开，重新初始化互动sdk')
+      const old = this.$store.state.rtc
+      if (old) {
+        this.$store.state.rtc = null
+        this.rtc = null
+        old.destroyInstance().catch(() => null)
+      }
+
+      // 重新初始化
+      const option = this.$store.getters.getSdkOption
+      try {
+        this.$store.state.rtc = await this.tryInitAndSetRtc(option)
+      } catch (e) {
+        this.reInitRtcing = false
+        roomApi.report(this.$store.getters.roomId, e)
+        return this.$message.error('互动房间重连失败，请检查网络')
+      }
+      this.reInitRtcing = false
+      this.$message.info('互动房间重连成功')
+
+      // 上麦
+      const streamId = this.$store.state.stream.local?.streamId
+      // 桌面共享，开了共享，但是没有推 #26989
+      const desktopId = this.$store.state.stream?.desktop?.streamId
+
+      if (streamId) this.$store.commit('setLocalStream', {})
+      if (desktopId) this.$store.commit('setLocalDesktopStream', {})
+      if (this.isMaster) await this.invaPublishMaster()
+      // 因为桌面共享需要选择，所以不恢复桌面共享
+      // if (desktopId) this.openDesktopShare({to: 'desktopShare', from: ''})
+    },
+    // 开始/结束推流
+    async liveChange(on) {
+      if (process.env.NODE_ENV !== 'production') console.log('liveChange', on)
+      if (on) {
+        if (this.livein) return
+        await this._liveStart()
+        return
+      }
+
+      if (!this.livein) return
+      await this._liveStop()
+    },
+
+    // 开始直播
+    async _liveStart() {
+      // 不存在本地流，则创建
+      this.$store.state.liveChanging = true
+      try {
+        await this.invaPublishMaster()
+        this.$root.$emit('startPublish')
+      } catch (e) {
+        this.$message.error(e.message)
+        roomApi.report(this.$store.getters.roomId, e)
+      }
+      this.$store.state.liveChanging = false
+    },
+    // 结束直播
+    async _liveStop() {
+      if (!this.$store.getters.livein) return
+      // 关闭旁路直播
+      this.$store.state.liveChanging = true
+      try {
+        await this.$store.dispatch('setAnotherPush', false)
+      } catch (e) {
+        console.error('关闭旁路出错', e)
+        this.$message.error('关闭旁路出错')
+        roomApi.report(this.$store.getters.roomId, e)
+      }
+
+      // 停止推流
+      await this.$store.dispatch('unpublish', {type: 'desktop'}).catch(e => e)
+      const e = await this.$store.dispatch('unpublish', {type: 'local'}).catch(e => e)
+      if (e instanceof Error) {
+        this.$message.error(e.message)
+      }
+      this.$store.state.liveChanging = false
+      // 销毁
+      this.rtc.destroyInstance({})
+      this.$store.state.rtc = null
+      this.rtc = null
+
+      this.$root.$emit('stopPublish')
+    },
+
+    // 初始化房间数据
+    async init(sdk) {
+      // 加载上麦请求列表
+      this.$store.dispatch('getInvaRequestList').catch(console.error)
+      // 获取聊天用户列表
+      this.$store.dispatch('getOnlineImList').catch(console.error)
+      this.$store.dispatch('getKickList').catch(console.error)
+    },
+
+    // 主持人上麦
+    async invaPublishMaster() {
+      let streamId = this.$store.state.stream.local?.streamId
+      // 桌面共享，开了共享，但是没有推 #26989
+      const desktopId = this.$store.state.stream?.desktop?.streamId
+
+      this.$store.state.rtc = await this.tryInitAndSetRtc()
+
+      // master 主持人上麦（自动）
+      if (!streamId) {
+        const rs = await this.tryCreateLocalStream(false)
+        if (rs) streamId = rs.streamId
+        if (rs) this.$store.commit('setLocalStream', {streamId: rs.streamId, audio: rs.audio, video: rs.video})
+      }
+      await this.$nextTick()
+      // 开始推流
+      await this.$store.dispatch('publish', {})
+
+      if (desktopId && !this.$store.state.stream?.desktop?.publishing) {
+        try {
+          // 推流
+          await this.$store.dispatch('publish', {streamId, type: 'desktop'})
+        } catch (e) {
+          // 共享失败了就删掉这个流
+          this.$store.commit('delLocalStream', streamId)
+          this.$message.error('共享桌面操作失败')
+          if (this.rtc) this.rtc.destroyStream({streamId})
+          roomApi.report(this.$store.getters.roomId, e)
+          throw e
+        }
+      }
+
+      // 开始旁路直播
+      try {
+        // debugger
+        await this.$store.dispatch('setAnotherPush', true)
+      } catch (e) {
+        console.error('旁路失败', e)
+        this.$message.error('旁路失败')
+        roomApi.report(this.$store.getters.roomId, e)
+        throw e
+      }
+    },
+
+    // 设备切换
+    async changeDevice() {
+      const originStream = this.$store.state.stream.local
+      let streamId
+      try {
+        const rs = await this.tryCreateLocalStream(false)
+        if (!rs) return this.$message.error('设备切换失败')
+        streamId = rs.streamId
+        this.$store.commit('setLocalStream', {streamId: rs.streamId, audio: rs.audio, video: rs.video})
+        if (originStream) {
+          // 切换摄像头
+          await this.$store.dispatch('switchVideoDevice', {streamId, deviceId: rs.videoDevice})
+          // 切换音频设备
+          await this.$store.dispatch('switchAudioDevice', {streamId, deviceId: rs.audioDevice})
+          // 删除旧的流
+          this.$store.dispatch('unpublish', {streamId: originStream.streamId})
+          // 已经切换就不用重推
+          // return
+        }
+      } catch (e) {
+        // 还原之前的流
+        if (originStream) this.$store.commit('setLocalStream', {
+          streamId: originStream.streamId,
+          audio: originStream.audio,
+          video: originStream.video
+        })
+        return this.$message.error('切换设备出错')
+      }
+
+      try {
+        await this.$store.dispatch('publish', {type: 'local'})
+      } catch (err) {
+        const t = 'publish出错: ' + err.message
+        roomApi.report(this.$store.getters.roomId, err)
+        return this.$message.error(t)
+      }
+
+      // 推流中
+      if (this.livein) {
+        // 更新混流布局
+        if (!(this.livein && !this.$store.state.stream.desktop)) return
+        await this.$store.dispatch('setBroadCastLayout', {}).catch(e => null)
+        this.$store.dispatch('setPublishMainScreen', {stream: this.$store.state.stream.local.streamId})
+      }
+    },
+
+    // 开启桌面共享
+    async openDesktopShare({to, from}) {
+      if (!isScreenShareSupported()) {
+        this.$message.error('您的浏览器不支持屏幕共享')
+        return
+      }
+
+      // 开启桌面共享
+      const streamId = await this.tryCreateDesktopStream(false)
+      if (!streamId) return
+      this.$store.commit('setSideActive', to)
+      await this.$nextTick()
+      // 没有开播，不推流
+      if (!this.$store.getters.livein) {
+        return
+      }
+      try {
+        // 推流
+        await this.$store.dispatch('publish', {streamId, type: 'desktop'})
+      } catch (e) {
+        // 共享失败了就删掉这个流
+        this.$store.commit('delLocalStream', streamId)
+        this.$message.error('共享桌面操作失败')
+        if (this.rtc) this.rtc.destroyStream({streamId})
+      }
+      // 推流中
+      if (this.livein) {
+        // 设置混流只显示"桌面共享"
+        await this.$store.dispatch('setBroadCastLayout', {layout: window.VhallRTC.CANVAS_LAYOUT_PATTERN_GRID_1}).catch(e => null)
+        // 设置主屏幕
+        await this.$store.dispatch('setPublishMainScreen', {streamId})
+      }
+    },
+    // 关闭桌面共享
+    async closeDesktopShare({to, from}) {
+      // 确认了，进行关闭桌面共享
+      const streamId = this.$store.state.stream.desktop?.streamId
+      this.$store.commit('delLocalStream', streamId)
+      if (this.rtc) this.rtc.destroyStream({streamId})
+      this.$store.commit('setSideActive', to)
+      // 推流中
+      if (this.livein) {
+        // 设置混流只显示"桌面共享"
+        await this.$store.dispatch('setBroadCastLayout', {}).catch(e => null)
+        // 设置主屏幕
+        await this.$store.dispatch('setPublishMainScreen', {streamId: this.$store.state.stream.local?.streamId})
+      }
+    },
+
+    // region 创建本地流
+    // 尝试创建本地流 1摄像 2桌面共享 (并尝试设备选择)
+    async tryCreateDesktopStream(mustStream) {
+      // 已经弹出了设备选择
+      if (this.deviceSelect) return
+      let streamId
+      const option = {
+        video: true,
+        audio: false,
+        screen: true, //是否获取屏幕共享，选填，默认为false
+        speaker: false, // 桌面共享是否分享音频(chrome浏览器弹框左下角显示“分享音频”选框)，选填，默认为true
+        showControls: false, // 是否开启视频原生控制条，选填，默认为false
+        videoDevice: 'desktopScreen',
+      }
+      const rtc = await this.tryInitAndSetRtc()
+
+      // 桌面共享流 (每次都弹出设备选择)
+      try {
+        const rs = await this._createLocalStream(rtc, option, mustStream)
+        streamId = rs && rs.streamId
+      } catch (e) {
+        this.$message(e.message)
+        roomApi.report(this.$store.getters.roomId, e)
+        return
+      }
+
+      this.$store.commit('setLocalDesktopStream', streamId)
+      return streamId
+    },
+    // 创建摄像头本地流
+    async tryCreateLocalStream(mustStream) {
+      // 已经弹出了设备选择
+      if (this.deviceSelect) return
+      const deviceOption = this.$store.state.localStreamOption
+      const rtc = await this.tryInitAndSetRtc()
+
+      try {
+        const rs = await this._createLocalStream(rtc, deviceOption, mustStream)
+        return rs
+      } catch (e) {
+        roomApi.report(this.$store.getters.roomId, e)
+        this.$message.error(e.message)
+      }
+    },
+    // 创建本地流
+    async _createLocalStream(rtc, deviceOption, mustStream) {
+      const attributes = JSON.stringify(this.$store.getters.getUser)
+      rtc = rtc || this.rtc
+      let option = deviceOption ? Object.assign(deviceOption) : null
+      let videoDevice
+      let audioDevice
+      let streamId
+      let audio
+      let video
+
+      // 选择设备
+      if (!option) {
+        // 跳过（没有选择设备也应该有的，用的是默认选项）
+        // 弹出设备选择，并获得参数
+        const rs = await this.deviceSelectDialog(rtc, {type: 1, attributes, mustStream})
+        option = rs && rs[1]
+        // 取消了选择
+        if (!option) return
+        streamId = option.streamId
+        delete option.streamId
+
+        // 保存设置
+        this.$store.commit('setLocalStreamOption', option)
+
+        if (streamId) {
+          const rs = await promisify(rtc, rtc.getStreamMute, true)({streamId})
+          audio = !rs?.audioMuted ?? true
+          video = !rs?.videoMuted ?? true
+        }
+
+        return {videoDevice, audioDevice, streamId, audio, video}
+      }
+
+      // 创建本地流
+      option = Object.assign({}, {attributes}, option)
+      const data = await createLocalStream(rtc, option)
+
+      return data // { streamId, audio, video }
+    },
+    // 弹出设备选择
+    async deviceSelectDialog(rtc, data) {
+      if (this.deviceSelect) return
+      if (!rtc) return
+      this.deviceSelect = data?.type || 1
+      const attributes = data.attributes ? typeof data.attributes === 'string' ? data.attributes : JSON.stringify(data.attributes) : undefined
+
+      return new Promise((resolve, reject) => {
+        const onSelect = (ok, settings) => {
+          this.deviceSelect = 0
+          dia.hide()
+          resolve([ok, settings])
+        }
+        const opt = {attributes, rtc, onSelect, mustStream: data.mustStream}
+        const dia = VhDialog.open(DeviceDialogCtor, this, opt)
+        this.$once('hook:beforeDestroy', () => dia.hide())
+      })
+    },
+    // endregion 创建本地流
+
+    // region SDK初始化/销毁
+    async tryInitAndSetRtc(sdkOption, user) {
+      if (this.rtcInitLock) await this.rtcInitLock
+      let resolve = function () {
+      }
+      this.rtcInitLock = new Promise(r => resolve = r)
+      // if (this.$store.state.rtc) {
+      //   this.rtc = null
+      //   this.$store.state.rtc.destroyInstance({})
+      //   this.$store.state.rtc = null
+      // }
+
+      try {
+        if (!this.rtc) this.rtc = await this.initRTC(sdkOption, user)
+      } catch (e) {
+        this.rtcInitLock = null
+        roomApi.report(this.$store.getters.roomId, e)
+        throw e
+      }
+      resolve()
+      return this.rtc
+    },
+    // 初始化互动SDK
+    async initRTC($sdkOption, $user) {
+      // 注： VhallRTC.ROLE_AUDIENCE只能观看，无法上麦
+      const role = window.VhallRTC.ROLE_HOST
+      const sdkOption = $sdkOption || this.$store.getters.getSdkOption
+      const attributes = JSON.stringify($user || this.$store.getters.getUser)
+      const option = {
+        role: role,
+        appId: sdkOption.appId,
+        inavId: sdkOption.paasInavId,
+        roomId: sdkOption.paasLiveId,
+        channelId: sdkOption.paasImId,
+        accountId: sdkOption.accountId,
+        token: sdkOption.token,
+        attributes: attributes,
+        hide: false
+      }
+      if (process.env.NODE_ENV !== 'production') console.time('初始化互动SDK')
+      const {rtc, currentStreams} = await initRTC(option)
+      if (process.env.NODE_ENV !== 'production') console.timeEnd('初始化互动SDK')
+      this.currentStreams = currentStreams || []
+
+      // 记录正在推送的流，方便稍后订阅
+      for (const stream of currentStreams) {
+        const {accountId, streamId, streamType} = stream
+        const attributes = safeParse(stream.attributes)
+        this.$store.commit('addRemoteStream', {streamId, userId: accountId, streamType, attributes})
+      }
+
+      // 监听事件 （用户上线/下线，添加/移除流，黑名单事件，提前监听避免错过事件）
+      await rtcListen(rtc, this)
+      this.$on('hook:beforeDestroy', () => this.destroyRTC())
+      return rtc
+    },
+    // 销毁互动SDK
+    async destroyRTC() {
+      const $rtc = this.$store.getters.rtc
+      const stream = this.$store.state.stream
+      if ($rtc) {
+        try {
+          if (stream.local) $rtc.destroyStream({streamId: stream.local.streamId}, Function.prototype, Function.prototype)
+          if (stream.desktop) $rtc.destroyStream({streamId: stream.desktop.streamId}, Function.prototype, Function.prototype)
+        } catch (e) {
+          console.error(e)
+          roomApi.report(this.$store.getters.roomId, e)
+        }
+        try {
+          $rtc.destroyInstance({})
+        } catch (e) {
+          roomApi.report(this.$store.getters.roomId, e)
+          console.error(e)
+        }
+        this.sdk = null
+        this.$store.state.rtc = null
+      }
+    },
+    // 销毁sdk
+    destroySDK() {
+      this.destroyRTC()
+      const bus = this.$bus
+      bus.destroy()
+    }
+    // endregion SDK
+  },
+  beforeDestroy() {
+    inavApi.roomId = null
+    try {
+      this.destroySDK()
+      this.$store.commit('resetRoomData')
+    } catch (e) {
+      roomApi.report(this.$store.getters.roomId, e)
+      console.error(e)
+    }
+    if (this.rtc) {
+      this.rtc.destroyInstance()
+      this.rtc = null
+      this.$store.state.rtc = null
+    }
+  },
+  watch: {
+    chat: function (chat) {
+      if (!chat) return
+      if (this.$store.state.room.isVod) return
+      this.init()
+    },
+  }
+}
+</script>
+
+<style lang="less">
+// 小屏处理
+@media (max-height: 640px) {
+  .home {
+    zoom: 0.8;
+  }
+}
+@media (max-height: 400px) {
+  .home {
+    zoom: 0.6;
+  }
+}
+@media (max-height: 300px) {
+  .home {
+    zoom: 0.4;
+  }
+}
+
+.home {
+  display: flex;
+  flex-direction: column;
+  // max-height: 100vh;
+  justify-content: space-between;
+  // overflow: hidden;
+  height: 800px;
+  width: 1280px;
+  margin: auto;
+
+  .mainSideSet {
+    width: 100%;
+    height: 80px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    cursor: pointer;
+
+    > i {
+      font-size: 24px;
+    }
+
+    &:hover {
+      background: #222222;
+      color: #1e90ff;
+    }
+  }
+
+  .user-action-warp {
+    //width: 100%;
+    background-color: #0F0F0F;
+    height: 56px;
+    position: relative;
+    display: flex;
+
+    .action-setting {
+      width: 32px;
+      height: 32px;
+      position: absolute;
+      left: 10px;
+      margin: 12px;
+      background-color: #363636;
+      border-radius: 100%;
+      display: flex;
+      color: #aaaaaa;
+      cursor: pointer;
+
+      i {
+        margin: auto;
+      }
+    }
+
+    .action-inav-request {
+      margin: auto;
+    }
+
+    .action-inav-request /deep/ button[disable] {
+      pointer-events: none;
+      background: #3f79b1;
+      border-color: #000;
+      color: #b3b3b3;
+      cursor: not-allowed;
+    }
+  }
+}
+
+.home-content {
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  height: 100%;
+  //min-height: 800px;
+  flex-grow: 1;
+  overflow: hidden;
+  flex-basis: 0;
+  flex-wrap: wrap;
+
+  // 侧边栏
+  .main-side {
+    min-height: 700px;
+    height: 100%;
+    flex-grow: 1;
+    overflow: hidden;
+    flex-shrink: 0;
+    order: 0;
+  }
+
+  // 用户列表
+  .main-user {
+    order: 9;
+    flex-grow: 1;
+    z-index: 0;
+    height: 500px;
+  }
+
+  // 主内容
+  .main-content {
+    min-height: 680px;
+    width: 980px;
+  }
+
+  .user-action-warp {
+  }
+
+  // 右上
+  .user-header {
+    width: 300px;
+    flex-grow: 0;
+    flex-shrink: 0;
+  }
+}
+
+// 小窗模式
+.home-content.sm2 {
+  // 隐藏非主要功能
+  .main-content {
+    flex-grow: 0;
+
+    .brush-box {
+      display: none !important;
+    }
+
+    .fileList {
+      display: none !important;
+    }
+
+    .fileMenuBox {
+      display: none !important;
+    }
+
+    .preview-mark {
+      display: none !important;
+    }
+
+    .doc-box {
+      pointer-events: none;
+    }
+    .docFileView {
+      border: none;
+    }
+  }
+
+  // 右上移动到内容区时隐藏功能
+  .user-header {
+    flex-grow: 1;
+
+    .licode_player {
+      video {
+        object-fit: contain;
+      }
+    }
+
+    .moreInfo {
+      display: none;
+    }
+  }
+
+  .remote-stream-list {
+    height: 30px;
+    width: 100%;
+    position: absolute;
+    z-index: 9;
+    bottom: 0;
+    overflow: hidden;
+    background-color: rgba(0, 0, 0, 30%);
+    justify-content: flex-start;
+    pointer-events: none;
+
+    .StreamItem {
+      width: 48px !important;
+
+      .moreInfo {
+        display: none;
+      }
+      .more-info {
+        display: none;
+      }
+
+      .debug {
+        display: none;
+      }
+    }
+  }
+}
+
+
+/* 页面转换 */
+.home-content {
+  .main-content {
+    order: 4;
+    width: 980px;
+  }
+
+  .user-action-warp {
+    order: 5;
+  }
+
+  .user-header {
+    order: 6;
+    width: 300px;
+  }
+}
+
+.home-content.sm2 {
+  .main-content {
+    order: 6;
+    width: 300px;
+    height: 170px;
+    flex-grow: 0;
+    min-height: 170px;
+    overflow: hidden;
+  }
+
+  .user-action-warp {
+    order: 5;
+  }
+
+  .user-header {
+    order: 4;
+    width: 980px;
+    min-height: 600px;
+    //height: 100%;
+  }
+}
+
+.home-content.side {
+  .main-content {
+    order: 4;
+    width: 900px;
+  }
+
+  .user-action-warp {
+    order: 5;
+  }
+
+  .user-header {
+    order: 6;
+    width: 300px;
+  }
+}
+
+.home-content.side.sm2 {
+  .main-content {
+    order: 6;
+    width: 300px;
+    height: 170px;
+    flex-grow: 0;
+    min-height: 170px;
+  }
+
+  .user-action-warp {
+    order: 5;
+  }
+
+  .user-header {
+    order: 4;
+    width: 900px;
+    //height: 100%;
+    min-height: 600px;
+  }
+}
+
+</style>

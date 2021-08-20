@@ -1,8 +1,8 @@
 <template>
   <transition name="message-fade" @after-leave="handleAfterLeave">
     <div v-if="visible" :class="wrapClasses" :style="positionStyle">
-      <img class="message_img" :src="typeImg" />
-      <span class="">{{ message }}</span>
+      <img class="message-img" :src="typeImg" />
+      <span class="message-text">{{ message }}</span>
     </div>
   </transition>
 </template>
@@ -82,7 +82,7 @@ export default {
   position: fixed;
   top: 15px;
   left: 50%;
-  width: 320px;
+  min-width: 320px;
   transform: translateX(-50%);
   height: 36px;
   border-radius: 4px;
@@ -103,7 +103,7 @@ export default {
 .message-close:hover {
   color: #0c0c0c;
 }
-.message_img {
+.message-img {
   display: inline-block;
   border-radius: 50%;
   width: 16px;
@@ -125,5 +125,8 @@ export default {
 .message-error {
   background: #ffe2e2;
   color: rgb(255, 108, 108);
+}
+.message-text {
+  word-break: keep-all;
 }
 </style>

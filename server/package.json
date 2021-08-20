@@ -23,8 +23,11 @@
     "@hapi/wreck": "^17.1.0",
     "@hapi/yar": "^9.2.1",
     "biguint-format": "^1.0.2",
+    "domhandler": "^4.2.0",
     "flake-idgen": "^1.4.0",
+    "form-data": "^4.0.0",
     "getconfig": "^4.5.0",
+    "htmlparser2": "^6.1.0",
     "joi": "^17.3.0",
     "lodash": "^4.17.20",
     "moment": "^2.29.1",
@@ -33,7 +36,9 @@
     "pg": "^8.5.1",
     "private-ip": "^2.0.0",
     "sequelize": "^6.3.5",
-    "uuid": "^8.3.2"
+    "syslog-client": "^1.1.1",
+    "uuid": "^8.3.2",
+    "xlsx": "^0.17.0"
   },
   "devDependencies": {},
   "optionalDependencies": {
